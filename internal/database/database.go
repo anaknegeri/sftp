@@ -13,7 +13,7 @@ import (
 )
 
 func NewDatabase(cfg config.Database) (*gorm.DB, error) {
-	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s TimeZone=UTC",
+	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s TimeZone=Asia/Jakarta",
 		cfg.Host, cfg.Port, cfg.Username, cfg.Password, cfg.Database, cfg.SSLMode)
 
 	gormConfig := &gorm.Config{
@@ -51,6 +51,8 @@ func NewDatabase(cfg config.Database) (*gorm.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get database instance: %w", err)
 	}
+
+	sqlDB.Exec("SET timezone = 'Asia/Jakarta'")
 
 	sqlDB.SetMaxOpenConns(20)
 	sqlDB.SetMaxIdleConns(10)

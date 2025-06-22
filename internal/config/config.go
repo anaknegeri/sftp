@@ -18,6 +18,7 @@ type Config struct {
 	LocalPath string
 	LogPath   string
 	GRPCPort  string
+	NATSURL   string
 }
 
 type Database struct {
@@ -55,6 +56,7 @@ func Load() *Config {
 		LocalPath: getEnv("LOCAL_PATH", "./temp"),
 		LogPath:   getEnv("LOG_PATH", "./logs"),
 		GRPCPort:  getEnv("SFTP_SERVICE_PORT", "9082"),
+		NATSURL:   getEnv("NATS_URL", "nats://localhost:4222"),
 	}
 }
 

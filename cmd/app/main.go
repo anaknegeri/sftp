@@ -7,7 +7,10 @@ import (
 	databse "jarvist/sftp/internal/database"
 	"jarvist/sftp/internal/file"
 	grpcHandler "jarvist/sftp/internal/grpc"
+	"jarvist/sftp/internal/job"
+	"jarvist/sftp/internal/queue"
 	"jarvist/sftp/internal/repository"
+	"jarvist/sftp/internal/scheduler"
 	"jarvist/sftp/internal/service"
 	pb "jarvist/sftp/pkg/pb"
 	"log"
@@ -31,13 +34,32 @@ func main() {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
 
+	jobQueue, err := queue.NewJobQueue(cfg.NATSURL)
+	if err != nil {
+		log.Fatalf("Failed to initialize job queue: %v", err)
+	}
+	defer jobQueue.Close()
+
 	// Initialize dependencies
 	peopleRepo := repository.NewPeopleCountRepository(db)
 	sftpLogRepo := repository.NewSFTPLogRepository(db)
 	csvWriter := file.NewCSVWriter(cfg.LocalPath)
 
 	// Initialize service
-	exportService := service.NewExportService(peopleRepo, sftpLogRepo, csvWriter, cfg.LocalPath)
+	exportService := service.NewExportService(peopleRepo, sftpLogRepo, csvWriter, cfg.LocalPath, jobQueue)
+	sftpService := service.NewSFTPService(sftpLogRepo, cfg.LocalPath)
+
+	// Initialize job processor
+	jobProcessor := job.NewJobProcessor(jobQueue, exportService, sftpService)
+	if err := jobProcessor.Start(); err != nil {
+		log.Fatalf("Failed to start job processor: %v", err)
+	}
+
+	// Initialize scheduler
+	jobScheduler := scheduler.NewScheduler(jobQueue, sftpService, cfg.LocalPath)
+	if err := jobScheduler.Start(); err != nil {
+		log.Fatalf("Failed to start scheduler: %v", err)
+	}
 
 	// Initialize gRPC server
 	exportGRPCServer := grpcHandler.NewSFTPGRPCServer(exportService)
