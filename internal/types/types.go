@@ -2,9 +2,20 @@ package types
 
 import "time"
 
+// Subject constants yang sesuai dengan format baru NATS
 const (
 	SubjectGenerateReport = "job.sftp.generate.report"
 	SubjectUploadSFTP     = "job.sftp.upload.sftp"
+)
+
+// Job type constants untuk NATS subject mapping
+const (
+	JobTypeGenerateReport = "generate_report"
+	JobTypeUploadSFTP     = "upload_sftp"
+	JobTypeDailyExport    = "daily_export"
+	JobType30MinExport    = "30min_export"
+	JobTypeRepush         = "repush"
+	JobTypeLateDataCheck  = "late_data_check"
 )
 
 type GenerateReportJob struct {
@@ -22,4 +33,13 @@ type UploadSFTPJob struct {
 	FileType   string    `json:"file_type"`
 	LocationID string    `json:"location_id,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
+}
+
+// Job payload untuk NATS messaging
+type JobPayload struct {
+	ID       string    `json:"id"`
+	Type     string    `json:"type"`
+	TenantID string    `json:"tenant_id"`
+	Data     string    `json:"data"`
+	Created  time.Time `json:"created"`
 }
