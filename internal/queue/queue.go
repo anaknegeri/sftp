@@ -188,6 +188,8 @@ func (q *natsJobQueue) convertToNATSSubject(oldSubject string) string {
 		return "sftp.jobs.generate_report"
 	case "job.sftp.upload.sftp":
 		return "sftp.jobs.upload_sftp"
+	case "job.sftp.late.data.check":
+		return "sftp.jobs.late_data_check"
 	default:
 		// Generic conversion
 		parts := strings.Split(oldSubject, ".")

@@ -75,10 +75,11 @@ func main() {
 	// Initialize services
 	exportService := service.NewExportService(peopleRepo, sftpLogRepo, csvWriter, cfg.LocalPath, jobQueue)
 	sftpService := service.NewSFTPService(sftpLogRepo, cfg.LocalPath)
+	lateDataService := service.NewLateDataService(peopleRepo, sftpLogRepo, csvWriter, cfg.LocalPath)
 
 	// Initialize job processor
 	log.Println("Starting job processor...")
-	jobProcessor := job.NewJobProcessor(jobQueue, exportService, sftpService)
+	jobProcessor := job.NewJobProcessor(jobQueue, exportService, sftpService, lateDataService)
 	if err := jobProcessor.Start(); err != nil {
 		log.Fatalf("Failed to start job processor: %v", err)
 	}

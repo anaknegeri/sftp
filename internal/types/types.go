@@ -6,6 +6,7 @@ import "time"
 const (
 	SubjectGenerateReport = "job.sftp.generate.report"
 	SubjectUploadSFTP     = "job.sftp.upload.sftp"
+	SubjectLateDataCheck  = "job.sftp.late.data.check" // NEW
 )
 
 // Job type constants untuk NATS subject mapping
@@ -15,7 +16,7 @@ const (
 	JobTypeDailyExport    = "daily_export"
 	JobType30MinExport    = "30min_export"
 	JobTypeRepush         = "repush"
-	JobTypeLateDataCheck  = "late_data_check"
+	JobTypeLateDataCheck  = "late_data_check" // NEW
 )
 
 type GenerateReportJob struct {
@@ -33,6 +34,14 @@ type UploadSFTPJob struct {
 	FileType   string    `json:"file_type"`
 	LocationID string    `json:"location_id,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
+}
+
+// NEW: Late data check job with optimized structure
+type LateDataCheckJob struct {
+	TenantID  string    `json:"tenant_id"`
+	Date      time.Time `json:"date"`
+	CheckType string    `json:"check_type"` // "realtime" or "historical"
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Job payload untuk NATS messaging
