@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -43,36 +44,49 @@ func (s *sftpService) UploadFile(job types.UploadSFTPJob) error {
 		return fmt.Errorf("tenant %s not found or disabled", job.TenantID)
 	}
 
-	// Create SFTP transfer log
-	transferLog := &entity.SFTPTransferLog{
-		ID:                uuid.New().String(),
-		TenantID:          job.TenantID,
-		LocationID:        job.LocationID,
-		FileName:          job.FileName,
-		FilePath:          job.FilePath,
-		RemotePath:        job.RemotePath,
-		Status:            "PENDING",
-		TransferStartTime: time.Now(),
-		FileType:          job.FileType,
-		CreatedAt:         time.Now(),
-	}
-
-	// Get file size
-	fileInfo, err := os.Stat(job.FilePath)
+	// Check if there's an existing log for this file
+	existingLog, err := s.sftpLogRepo.GetByFileName(job.FileName)
 	if err != nil {
-		transferLog.Status = "FAILED"
-		transferLog.ErrorMessage = &[]string{fmt.Sprintf("Failed to get file info: %v", err)}[0]
-		s.sftpLogRepo.Create(transferLog)
-		return fmt.Errorf("failed to get file info: %w", err)
+		log.Printf("[SFTP] Failed to check existing log: %v", err)
 	}
 
-	transferLog.FileSize = fileInfo.Size()
-	recordCount := utils.CountFileRecords(job.FilePath)
-	transferLog.RecordCount = &recordCount
+	var transferLog *entity.SFTPTransferLog
 
-	// Save initial log
-	if err := s.sftpLogRepo.Create(transferLog); err != nil {
-		log.Printf("[SFTP] Failed to create transfer log: %v", err)
+	if existingLog != nil && existingLog.Status == "PENDING" {
+		// Update existing log
+		transferLog = existingLog
+		transferLog.TransferStartTime = time.Now()
+		log.Printf("[SFTP] Using existing PENDING log for file %s (ID: %s)", job.FileName, transferLog.ID)
+	} else if existingLog != nil && existingLog.Status == "SUCCESS" {
+		// File already uploaded successfully
+		log.Printf("[SFTP] File %s already uploaded successfully, skipping", job.FileName)
+		return nil
+	} else {
+		// Create new log
+		transferLog = &entity.SFTPTransferLog{
+			ID:                uuid.New().String(),
+			TenantID:          job.TenantID,
+			LocationID:        job.LocationID,
+			FileName:          job.FileName,
+			FilePath:          job.FilePath,
+			RemotePath:        job.RemotePath,
+			Status:            "PENDING",
+			TransferStartTime: time.Now(),
+			FileType:          job.FileType,
+			CreatedAt:         time.Now(),
+		}
+
+		// Get file size and record count
+		if fileInfo, err := os.Stat(job.FilePath); err == nil {
+			transferLog.FileSize = fileInfo.Size()
+		}
+		recordCount := utils.CountFileRecords(job.FilePath)
+		transferLog.RecordCount = &recordCount
+
+		// Save initial log
+		if err := s.sftpLogRepo.Create(transferLog); err != nil {
+			log.Printf("[SFTP] Failed to create transfer log: %v", err)
+		}
 	}
 
 	// Perform upload with retry
@@ -153,7 +167,16 @@ func (s *sftpService) UploadAllPendingFiles(tenantID string) error {
 
 		// Create upload job
 		fileType := utils.DetermineFileType(fileName)
-		remotePath := filepath.Join("/upload", fileName)
+
+		// Get tenant config for proper remote path
+		tenantConfig, exists := config.GetTenantByID(tenantID)
+		if !exists {
+			log.Printf("[SFTP] Tenant %s not found, skipping file %s", tenantID, fileName)
+			continue
+		}
+
+		// Use forward slashes for remote path (Unix-style)
+		remotePath := strings.ReplaceAll(filepath.Join(tenantConfig.SFTP.BasePath, fileName), "\\", "/")
 
 		uploadJob := types.UploadSFTPJob{
 			TenantID:   tenantID,
@@ -178,6 +201,11 @@ func (s *sftpService) UploadAllPendingFiles(tenantID string) error {
 }
 
 func (s *sftpService) performUpload(sftpConfig config.SFTPConfig, localPath, remotePath string) error {
+	// Normalize remote path untuk Unix (remove Windows backslashes)
+	remotePath = strings.ReplaceAll(remotePath, "\\", "/")
+
+	log.Printf("[SFTP] Uploading %s to %s", localPath, remotePath)
+
 	// Create SSH client config
 	sshConfig := &ssh.ClientConfig{
 		User: sftpConfig.User,
@@ -227,14 +255,24 @@ func (s *sftpService) performUpload(sftpConfig config.SFTPConfig, localPath, rem
 
 	// Create remote directory if it doesn't exist
 	remoteDir := filepath.Dir(remotePath)
-	if err := sftpClient.MkdirAll(remoteDir); err != nil {
-		return fmt.Errorf("failed to create remote directory: %w", err)
+	if remoteDir != "." && remoteDir != "/" {
+		remoteDir = strings.ReplaceAll(remoteDir, "\\", "/")
+		log.Printf("[SFTP] Creating remote directory: %s", remoteDir)
+
+		// Try to create directory, but don't fail if it already exists
+		if err := sftpClient.MkdirAll(remoteDir); err != nil {
+			// Check if it's a permission error or if directory already exists
+			if _, statErr := sftpClient.Stat(remoteDir); statErr != nil {
+				return fmt.Errorf("failed to create remote directory %s: %w", remoteDir, err)
+			}
+			log.Printf("[SFTP] Directory %s already exists or permission issue, continuing...", remoteDir)
+		}
 	}
 
 	// Create remote file
 	remoteFile, err := sftpClient.Create(remotePath)
 	if err != nil {
-		return fmt.Errorf("failed to create remote file: %w", err)
+		return fmt.Errorf("failed to create remote file %s: %w", remotePath, err)
 	}
 	defer remoteFile.Close()
 

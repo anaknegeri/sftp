@@ -105,7 +105,7 @@ func (q *natsJobQueue) PublishJob(subject string, job interface{}) error {
 	// Convert subject format
 	natsSubject := q.convertToNATSSubject(subject)
 
-	log.Printf("[QUEUE] Publishing job to subject: %s", natsSubject)
+	log.Printf("[QUEUE] Publishing job to subject: %s (data size: %d bytes)", natsSubject, len(data))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -115,7 +115,7 @@ func (q *natsJobQueue) PublishJob(subject string, job interface{}) error {
 		return fmt.Errorf("failed to publish job: %w", err)
 	}
 
-	log.Printf("[QUEUE] Job published successfully, sequence: %d", ack.Sequence)
+	log.Printf("[QUEUE] Job published successfully, sequence: %d, stream: %s", ack.Sequence, ack.Stream)
 	return nil
 }
 
@@ -123,50 +123,62 @@ func (q *natsJobQueue) SubscribeJob(subject string, handler JobHandler) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Convert expected subject untuk filtering
+	expectedSubject := q.convertToNATSSubject(subject)
+
+	log.Printf("[QUEUE] Setting up subscription for subject: %s (NATS subject: %s)", subject, expectedSubject)
+
 	// Create consumer dengan pattern seperti referensi
+	consumerName := fmt.Sprintf("%s-%s", ConsumerName, strings.ReplaceAll(subject, ".", "-"))
 	consumerConfig := jetstream.ConsumerConfig{
-		Name:          ConsumerName,
-		FilterSubject: SubjectJobs, // Listen to all jobs
+		Name:          consumerName,
+		FilterSubject: expectedSubject, // Filter to specific subject instead of wildcard
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		MaxDeliver:    3,
-		AckWait:       10 * time.Minute,
+		AckWait:       30 * time.Second, // Reduced from 10 minutes
+		ReplayPolicy:  jetstream.ReplayInstantPolicy,
 	}
+
+	log.Printf("[QUEUE] Creating consumer: %s with filter: %s", consumerName, expectedSubject)
 
 	consumer, err := q.js.CreateOrUpdateConsumer(ctx, StreamName, consumerConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create consumer: %w", err)
 	}
 
-	// Convert expected subject untuk filtering
-	expectedSubject := q.convertToNATSSubject(subject)
+	log.Printf("[QUEUE] Consumer created successfully: %s", consumerName)
 
-	// Start consuming
+	// Start consuming with detailed logging
 	_, err = consumer.Consume(func(msg jetstream.Msg) {
 		msgSubject := msg.Subject()
 
-		// Filter messages berdasarkan subject yang diinginkan
-		if expectedSubject == "sftp.jobs.*" || msgSubject == expectedSubject {
-			log.Printf("[QUEUE] Processing job from subject: %s", msgSubject)
+		log.Printf("[QUEUE] Received message from subject: %s (expected: %s)", msgSubject, expectedSubject)
+		log.Printf("[QUEUE] Message headers: %v", msg.Headers())
+		log.Printf("[QUEUE] Message data size: %d bytes", len(msg.Data()))
 
-			if err := handler(msg.Data()); err != nil {
-				log.Printf("[QUEUE] Job processing failed: %v", err)
-				msg.Nak()
-				return
-			}
+		// Process the message since we're already filtering by subject in consumer
+		log.Printf("[QUEUE] Processing job from subject: %s", msgSubject)
 
-			msg.Ack()
-			log.Printf("[QUEUE] Job processed successfully")
-		} else {
-			// Skip dan ack message yang tidak sesuai filter
-			msg.Ack()
+		startTime := time.Now()
+		if err := handler(msg.Data()); err != nil {
+			duration := time.Since(startTime)
+			log.Printf("[QUEUE] Job processing failed after %v: %v", duration, err)
+			msg.Nak()
+			return
 		}
-	})
+
+		duration := time.Since(startTime)
+		msg.Ack()
+		log.Printf("[QUEUE] Job processed successfully in %v", duration)
+	}, jetstream.ConsumeErrHandler(func(consumeCtx jetstream.ConsumeContext, err error) {
+		log.Printf("[QUEUE] Consumer error for %s: %v", consumerName, err)
+	}))
 
 	if err != nil {
 		return fmt.Errorf("failed to start consuming: %w", err)
 	}
 
-	log.Printf("[QUEUE] Subscribed to jobs for subject pattern: %s", expectedSubject)
+	log.Printf("[QUEUE] Subscribed successfully to subject: %s (consumer: %s)", expectedSubject, consumerName)
 	return nil
 }
 

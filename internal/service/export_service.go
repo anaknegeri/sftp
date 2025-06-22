@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -380,10 +381,33 @@ func (s *exportService) getLocationByID(tenantID, locationID string) (entity.Loc
 }
 
 // saveFileAndQueueUpload saves file information to database with PENDING status
-// and publishes upload job to queue for asynchronous processing
 func (s *exportService) saveFileAndQueueUpload(tenantID, locationID, filePath string) error {
 	fileName := filepath.Base(filePath)
 	fileType := utils.DetermineFileType(fileName)
+
+	// Check if there's already a recent successful upload for this file
+	existingLog, err := s.sftpLogRepo.GetByFileName(fileName)
+	if err != nil {
+		log.Printf("[EXPORT] Failed to check existing log for %s: %v", fileName, err)
+	}
+
+	// Prevent duplicates only for very recent uploads (5 minutes) to avoid accidental rapid fire
+	if existingLog != nil && existingLog.Status == "SUCCESS" {
+		if time.Since(existingLog.CreatedAt) < 5*time.Minute {
+			log.Printf("[EXPORT] File %s already uploaded successfully %.1f minutes ago, skipping to prevent rapid duplicate",
+				fileName, time.Since(existingLog.CreatedAt).Minutes())
+			return nil
+		}
+
+		// For older successful uploads, allow repush and log it clearly
+		log.Printf("[EXPORT] File %s was uploaded successfully %.1f minutes ago, proceeding with repush", fileName, time.Since(existingLog.CreatedAt).Minutes())
+	}
+
+	// Get tenant configuration to determine the remote path
+	tenantConfig, exists := config.GetTenantByID(tenantID)
+	if !exists {
+		return fmt.Errorf("tenant %s not found or disabled", tenantID)
+	}
 
 	// Get file information
 	fileInfo, err := os.Stat(filePath)
@@ -393,36 +417,64 @@ func (s *exportService) saveFileAndQueueUpload(tenantID, locationID, filePath st
 
 	recordCount := utils.CountFileRecords(filePath)
 
-	// Create SFTP transfer log with PENDING status
-	transferLog := &entity.SFTPTransferLog{
-		ID:                uuid.New().String(),
-		TenantID:          tenantID,
-		LocationID:        locationID,
-		FileName:          fileName,
-		FilePath:          filePath,
-		RemotePath:        filepath.Join("/upload", fileName),
-		Status:            "PENDING",
-		FileSize:          fileInfo.Size(),
-		TransferStartTime: time.Now(),
-		RecordCount:       &recordCount,
-		FileType:          fileType,
-		CreatedAt:         time.Now(),
-	}
+	// Create remote path using tenant's base path (normalize to Unix-style path)
+	remotePath := strings.ReplaceAll(filepath.Join(tenantConfig.SFTP.BasePath, fileName), "\\", "/")
 
-	// Save log to database
-	if err := s.sftpLogRepo.Create(transferLog); err != nil {
-		log.Printf("[EXPORT] Failed to create transfer log for %s: %v", fileName, err)
-		return fmt.Errorf("failed to create transfer log: %w", err)
-	}
+	var transferLog *entity.SFTPTransferLog
 
-	log.Printf("[EXPORT] File log created: %s (PENDING)", fileName)
+	if existingLog != nil && existingLog.Status == "PENDING" {
+		// Update existing PENDING log instead of creating new one
+		transferLog = existingLog
+		transferLog.FilePath = filePath
+		transferLog.RemotePath = remotePath
+		transferLog.FileSize = fileInfo.Size()
+		transferLog.RecordCount = &recordCount
+		transferLog.TransferStartTime = time.Now()
+
+		// Update existing log in database
+		if err := s.sftpLogRepo.Update(transferLog); err != nil {
+			log.Printf("[EXPORT] Failed to update existing PENDING log for %s: %v", fileName, err)
+			return fmt.Errorf("failed to update transfer log: %w", err)
+		}
+
+		log.Printf("[EXPORT] Updated existing PENDING log for %s", fileName)
+	} else {
+		// Create new SFTP transfer log with PENDING status
+		// This handles both initial uploads and repush attempts
+		transferLog = &entity.SFTPTransferLog{
+			ID:                uuid.New().String(),
+			TenantID:          tenantID,
+			LocationID:        locationID,
+			FileName:          fileName,
+			FilePath:          filePath,
+			RemotePath:        remotePath,
+			Status:            "PENDING",
+			FileSize:          fileInfo.Size(),
+			TransferStartTime: time.Now(),
+			RecordCount:       &recordCount,
+			FileType:          fileType,
+			CreatedAt:         time.Now(),
+		}
+
+		// Save log to database
+		if err := s.sftpLogRepo.Create(transferLog); err != nil {
+			log.Printf("[EXPORT] Failed to create transfer log for %s: %v", fileName, err)
+			return fmt.Errorf("failed to create transfer log: %w", err)
+		}
+
+		logType := "initial"
+		if existingLog != nil {
+			logType = "repush"
+		}
+		log.Printf("[EXPORT] File log created (%s): %s (PENDING) with remote path: %s", logType, fileName, remotePath)
+	}
 
 	// Create upload job for queue
 	uploadJob := types.UploadSFTPJob{
 		TenantID:   tenantID,
 		FilePath:   filePath,
 		FileName:   fileName,
-		RemotePath: transferLog.RemotePath,
+		RemotePath: remotePath,
 		FileType:   fileType,
 		LocationID: locationID,
 		CreatedAt:  time.Now(),
