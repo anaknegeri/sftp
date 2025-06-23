@@ -71,6 +71,7 @@ func main() {
 	exportService := service.NewExportService(peopleRepo, sftpLogRepo, csvWriter, cfg.LocalPath, jobQueue)
 	sftpService := service.NewSFTPService(sftpLogRepo, cfg.LocalPath)
 	lateDataService := service.NewLateDataService(peopleRepo, sftpLogRepo, csvWriter, cfg.LocalPath)
+	lateDataService.SetSFTPService(sftpService)
 
 	// Initialize NATS worker (for consuming jobs)
 	log.Println("Starting NATS worker...")
@@ -96,7 +97,7 @@ func main() {
 
 	// Start gRPC server
 	log.Printf("Starting gRPC server on port %s...", cfg.GRPCPort)
-	exportGRPCServer := grpcHandler.NewSFTPGRPCServer(exportService)
+	exportGRPCServer := grpcHandler.NewSFTPGRPCServer(exportService, sftpService)
 	go func() {
 		if err := startGRPCServer(cfg, exportGRPCServer); err != nil {
 			log.Fatalf("Failed to start gRPC server: %v", err)

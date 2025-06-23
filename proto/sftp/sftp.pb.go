@@ -358,6 +358,50 @@ func (x *ExportAllReportByLocationIDRequest) GetDate() string {
 	return ""
 }
 
+type UploadAllPendingFilesRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TenantId      string                 `protobuf:"bytes,1,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UploadAllPendingFilesRequest) Reset() {
+	*x = UploadAllPendingFilesRequest{}
+	mi := &file_proto_sftp_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UploadAllPendingFilesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UploadAllPendingFilesRequest) ProtoMessage() {}
+
+func (x *UploadAllPendingFilesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_sftp_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UploadAllPendingFilesRequest.ProtoReflect.Descriptor instead.
+func (*UploadAllPendingFilesRequest) Descriptor() ([]byte, []int) {
+	return file_proto_sftp_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *UploadAllPendingFilesRequest) GetTenantId() string {
+	if x != nil {
+		return x.TenantId
+	}
+	return ""
+}
+
 // Response messages
 type ExportResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -370,7 +414,7 @@ type ExportResponse struct {
 
 func (x *ExportResponse) Reset() {
 	*x = ExportResponse{}
-	mi := &file_proto_sftp_proto_msgTypes[6]
+	mi := &file_proto_sftp_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -382,7 +426,7 @@ func (x *ExportResponse) String() string {
 func (*ExportResponse) ProtoMessage() {}
 
 func (x *ExportResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sftp_proto_msgTypes[6]
+	mi := &file_proto_sftp_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -395,7 +439,7 @@ func (x *ExportResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportResponse.ProtoReflect.Descriptor instead.
 func (*ExportResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sftp_proto_rawDescGZIP(), []int{6}
+	return file_proto_sftp_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *ExportResponse) GetSuccess() bool {
@@ -432,7 +476,7 @@ type ExportStats struct {
 
 func (x *ExportStats) Reset() {
 	*x = ExportStats{}
-	mi := &file_proto_sftp_proto_msgTypes[7]
+	mi := &file_proto_sftp_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -444,7 +488,7 @@ func (x *ExportStats) String() string {
 func (*ExportStats) ProtoMessage() {}
 
 func (x *ExportStats) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sftp_proto_msgTypes[7]
+	mi := &file_proto_sftp_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -457,7 +501,7 @@ func (x *ExportStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportStats.ProtoReflect.Descriptor instead.
 func (*ExportStats) Descriptor() ([]byte, []int) {
-	return file_proto_sftp_proto_rawDescGZIP(), []int{7}
+	return file_proto_sftp_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ExportStats) GetTotalLocations() int32 {
@@ -510,7 +554,7 @@ type LocationStats struct {
 
 func (x *LocationStats) Reset() {
 	*x = LocationStats{}
-	mi := &file_proto_sftp_proto_msgTypes[8]
+	mi := &file_proto_sftp_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -522,7 +566,7 @@ func (x *LocationStats) String() string {
 func (*LocationStats) ProtoMessage() {}
 
 func (x *LocationStats) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sftp_proto_msgTypes[8]
+	mi := &file_proto_sftp_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -535,7 +579,7 @@ func (x *LocationStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LocationStats.ProtoReflect.Descriptor instead.
 func (*LocationStats) Descriptor() ([]byte, []int) {
-	return file_proto_sftp_proto_rawDescGZIP(), []int{8}
+	return file_proto_sftp_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *LocationStats) GetLocationId() string {
@@ -595,7 +639,7 @@ type HealthCheckRequest struct {
 
 func (x *HealthCheckRequest) Reset() {
 	*x = HealthCheckRequest{}
-	mi := &file_proto_sftp_proto_msgTypes[9]
+	mi := &file_proto_sftp_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -607,7 +651,7 @@ func (x *HealthCheckRequest) String() string {
 func (*HealthCheckRequest) ProtoMessage() {}
 
 func (x *HealthCheckRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sftp_proto_msgTypes[9]
+	mi := &file_proto_sftp_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -620,7 +664,7 @@ func (x *HealthCheckRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheckRequest.ProtoReflect.Descriptor instead.
 func (*HealthCheckRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sftp_proto_rawDescGZIP(), []int{9}
+	return file_proto_sftp_proto_rawDescGZIP(), []int{10}
 }
 
 type HealthCheckResponse struct {
@@ -633,7 +677,7 @@ type HealthCheckResponse struct {
 
 func (x *HealthCheckResponse) Reset() {
 	*x = HealthCheckResponse{}
-	mi := &file_proto_sftp_proto_msgTypes[10]
+	mi := &file_proto_sftp_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -645,7 +689,7 @@ func (x *HealthCheckResponse) String() string {
 func (*HealthCheckResponse) ProtoMessage() {}
 
 func (x *HealthCheckResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sftp_proto_msgTypes[10]
+	mi := &file_proto_sftp_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -658,7 +702,7 @@ func (x *HealthCheckResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheckResponse.ProtoReflect.Descriptor instead.
 func (*HealthCheckResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sftp_proto_rawDescGZIP(), []int{10}
+	return file_proto_sftp_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *HealthCheckResponse) GetOk() bool {
@@ -703,7 +747,9 @@ const file_proto_sftp_proto_rawDesc = "" +
 	"\ttenant_id\x18\x01 \x01(\tR\btenantId\x12\x1f\n" +
 	"\vlocation_id\x18\x02 \x01(\tR\n" +
 	"locationId\x12\x12\n" +
-	"\x04date\x18\x03 \x01(\tR\x04date\"o\n" +
+	"\x04date\x18\x03 \x01(\tR\x04date\";\n" +
+	"\x1cUploadAllPendingFilesRequest\x12\x1b\n" +
+	"\ttenant_id\x18\x01 \x01(\tR\btenantId\"o\n" +
 	"\x0eExportResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12)\n" +
@@ -726,14 +772,15 @@ const file_proto_sftp_proto_rawDesc = "" +
 	"\x12HealthCheckRequest\"?\n" +
 	"\x13HealthCheckResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage2\xb7\x04\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage2\x8e\x05\n" +
 	"\rExportService\x12A\n" +
 	"\vExportDaily\x12\x1a.export.ExportDailyRequest\x1a\x16.export.ExportResponse\x12A\n" +
 	"\vExport30Min\x12\x1a.export.Export30MinRequest\x1a\x16.export.ExportResponse\x12I\n" +
 	"\x0fExportAllReport\x12\x1e.export.ExportAllReportRequest\x1a\x16.export.ExportResponse\x12O\n" +
 	"\x12ExportByLocationID\x12!.export.ExportByLocationIDRequest\x1a\x16.export.ExportResponse\x12Y\n" +
 	"\x17Export30MinByLocationID\x12&.export.Export30MinByLocationIDRequest\x1a\x16.export.ExportResponse\x12a\n" +
-	"\x1bExportAllReportByLocationID\x12*.export.ExportAllReportByLocationIDRequest\x1a\x16.export.ExportResponse\x12F\n" +
+	"\x1bExportAllReportByLocationID\x12*.export.ExportAllReportByLocationIDRequest\x1a\x16.export.ExportResponse\x12U\n" +
+	"\x15UploadAllPendingFiles\x12$.export.UploadAllPendingFilesRequest\x1a\x16.export.ExportResponse\x12F\n" +
 	"\vHealthCheck\x12\x1a.export.HealthCheckRequest\x1a\x1b.export.HealthCheckResponseB\fZ\n" +
 	"proto/sftpb\x06proto3"
 
@@ -749,7 +796,7 @@ func file_proto_sftp_proto_rawDescGZIP() []byte {
 	return file_proto_sftp_proto_rawDescData
 }
 
-var file_proto_sftp_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_proto_sftp_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_proto_sftp_proto_goTypes = []any{
 	(*ExportDailyRequest)(nil),                 // 0: export.ExportDailyRequest
 	(*Export30MinRequest)(nil),                 // 1: export.Export30MinRequest
@@ -757,31 +804,34 @@ var file_proto_sftp_proto_goTypes = []any{
 	(*ExportByLocationIDRequest)(nil),          // 3: export.ExportByLocationIDRequest
 	(*Export30MinByLocationIDRequest)(nil),     // 4: export.Export30MinByLocationIDRequest
 	(*ExportAllReportByLocationIDRequest)(nil), // 5: export.ExportAllReportByLocationIDRequest
-	(*ExportResponse)(nil),                     // 6: export.ExportResponse
-	(*ExportStats)(nil),                        // 7: export.ExportStats
-	(*LocationStats)(nil),                      // 8: export.LocationStats
-	(*HealthCheckRequest)(nil),                 // 9: export.HealthCheckRequest
-	(*HealthCheckResponse)(nil),                // 10: export.HealthCheckResponse
+	(*UploadAllPendingFilesRequest)(nil),       // 6: export.UploadAllPendingFilesRequest
+	(*ExportResponse)(nil),                     // 7: export.ExportResponse
+	(*ExportStats)(nil),                        // 8: export.ExportStats
+	(*LocationStats)(nil),                      // 9: export.LocationStats
+	(*HealthCheckRequest)(nil),                 // 10: export.HealthCheckRequest
+	(*HealthCheckResponse)(nil),                // 11: export.HealthCheckResponse
 }
 var file_proto_sftp_proto_depIdxs = []int32{
-	7,  // 0: export.ExportResponse.stats:type_name -> export.ExportStats
-	8,  // 1: export.ExportStats.location_stats:type_name -> export.LocationStats
+	8,  // 0: export.ExportResponse.stats:type_name -> export.ExportStats
+	9,  // 1: export.ExportStats.location_stats:type_name -> export.LocationStats
 	0,  // 2: export.ExportService.ExportDaily:input_type -> export.ExportDailyRequest
 	1,  // 3: export.ExportService.Export30Min:input_type -> export.Export30MinRequest
 	2,  // 4: export.ExportService.ExportAllReport:input_type -> export.ExportAllReportRequest
 	3,  // 5: export.ExportService.ExportByLocationID:input_type -> export.ExportByLocationIDRequest
 	4,  // 6: export.ExportService.Export30MinByLocationID:input_type -> export.Export30MinByLocationIDRequest
 	5,  // 7: export.ExportService.ExportAllReportByLocationID:input_type -> export.ExportAllReportByLocationIDRequest
-	9,  // 8: export.ExportService.HealthCheck:input_type -> export.HealthCheckRequest
-	6,  // 9: export.ExportService.ExportDaily:output_type -> export.ExportResponse
-	6,  // 10: export.ExportService.Export30Min:output_type -> export.ExportResponse
-	6,  // 11: export.ExportService.ExportAllReport:output_type -> export.ExportResponse
-	6,  // 12: export.ExportService.ExportByLocationID:output_type -> export.ExportResponse
-	6,  // 13: export.ExportService.Export30MinByLocationID:output_type -> export.ExportResponse
-	6,  // 14: export.ExportService.ExportAllReportByLocationID:output_type -> export.ExportResponse
-	10, // 15: export.ExportService.HealthCheck:output_type -> export.HealthCheckResponse
-	9,  // [9:16] is the sub-list for method output_type
-	2,  // [2:9] is the sub-list for method input_type
+	6,  // 8: export.ExportService.UploadAllPendingFiles:input_type -> export.UploadAllPendingFilesRequest
+	10, // 9: export.ExportService.HealthCheck:input_type -> export.HealthCheckRequest
+	7,  // 10: export.ExportService.ExportDaily:output_type -> export.ExportResponse
+	7,  // 11: export.ExportService.Export30Min:output_type -> export.ExportResponse
+	7,  // 12: export.ExportService.ExportAllReport:output_type -> export.ExportResponse
+	7,  // 13: export.ExportService.ExportByLocationID:output_type -> export.ExportResponse
+	7,  // 14: export.ExportService.Export30MinByLocationID:output_type -> export.ExportResponse
+	7,  // 15: export.ExportService.ExportAllReportByLocationID:output_type -> export.ExportResponse
+	7,  // 16: export.ExportService.UploadAllPendingFiles:output_type -> export.ExportResponse
+	11, // 17: export.ExportService.HealthCheck:output_type -> export.HealthCheckResponse
+	10, // [10:18] is the sub-list for method output_type
+	2,  // [2:10] is the sub-list for method input_type
 	2,  // [2:2] is the sub-list for extension type_name
 	2,  // [2:2] is the sub-list for extension extendee
 	0,  // [0:2] is the sub-list for field type_name
@@ -798,7 +848,7 @@ func file_proto_sftp_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_sftp_proto_rawDesc), len(file_proto_sftp_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   11,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

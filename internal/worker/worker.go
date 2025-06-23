@@ -113,9 +113,9 @@ func (w *NATSWorker) Start() error {
 		"upload-sftp": {
 			Subject:     SubjectUploadSFTP,
 			Handler:     w.handleUploadSFTP,
-			Concurrency: 15,
-			BatchSize:   5,
-			AckWait:     180 * time.Second,
+			Concurrency: 25,
+			BatchSize:   10,
+			AckWait:     300 * time.Second,
 			MaxDeliver:  3,
 		},
 		"late-data-check": {

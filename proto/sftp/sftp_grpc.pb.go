@@ -25,6 +25,7 @@ const (
 	ExportService_ExportByLocationID_FullMethodName          = "/export.ExportService/ExportByLocationID"
 	ExportService_Export30MinByLocationID_FullMethodName     = "/export.ExportService/Export30MinByLocationID"
 	ExportService_ExportAllReportByLocationID_FullMethodName = "/export.ExportService/ExportAllReportByLocationID"
+	ExportService_UploadAllPendingFiles_FullMethodName       = "/export.ExportService/UploadAllPendingFiles"
 	ExportService_HealthCheck_FullMethodName                 = "/export.ExportService/HealthCheck"
 )
 
@@ -46,6 +47,8 @@ type ExportServiceClient interface {
 	Export30MinByLocationID(ctx context.Context, in *Export30MinByLocationIDRequest, opts ...grpc.CallOption) (*ExportResponse, error)
 	// Export all reports for specific location
 	ExportAllReportByLocationID(ctx context.Context, in *ExportAllReportByLocationIDRequest, opts ...grpc.CallOption) (*ExportResponse, error)
+	// Upload all pending upload
+	UploadAllPendingFiles(ctx context.Context, in *UploadAllPendingFilesRequest, opts ...grpc.CallOption) (*ExportResponse, error)
 	// HealthCheck
 	HealthCheck(ctx context.Context, in *HealthCheckRequest, opts ...grpc.CallOption) (*HealthCheckResponse, error)
 }
@@ -118,6 +121,16 @@ func (c *exportServiceClient) ExportAllReportByLocationID(ctx context.Context, i
 	return out, nil
 }
 
+func (c *exportServiceClient) UploadAllPendingFiles(ctx context.Context, in *UploadAllPendingFilesRequest, opts ...grpc.CallOption) (*ExportResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ExportResponse)
+	err := c.cc.Invoke(ctx, ExportService_UploadAllPendingFiles_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *exportServiceClient) HealthCheck(ctx context.Context, in *HealthCheckRequest, opts ...grpc.CallOption) (*HealthCheckResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(HealthCheckResponse)
@@ -146,6 +159,8 @@ type ExportServiceServer interface {
 	Export30MinByLocationID(context.Context, *Export30MinByLocationIDRequest) (*ExportResponse, error)
 	// Export all reports for specific location
 	ExportAllReportByLocationID(context.Context, *ExportAllReportByLocationIDRequest) (*ExportResponse, error)
+	// Upload all pending upload
+	UploadAllPendingFiles(context.Context, *UploadAllPendingFilesRequest) (*ExportResponse, error)
 	// HealthCheck
 	HealthCheck(context.Context, *HealthCheckRequest) (*HealthCheckResponse, error)
 	mustEmbedUnimplementedExportServiceServer()
@@ -175,6 +190,9 @@ func (UnimplementedExportServiceServer) Export30MinByLocationID(context.Context,
 }
 func (UnimplementedExportServiceServer) ExportAllReportByLocationID(context.Context, *ExportAllReportByLocationIDRequest) (*ExportResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ExportAllReportByLocationID not implemented")
+}
+func (UnimplementedExportServiceServer) UploadAllPendingFiles(context.Context, *UploadAllPendingFilesRequest) (*ExportResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UploadAllPendingFiles not implemented")
 }
 func (UnimplementedExportServiceServer) HealthCheck(context.Context, *HealthCheckRequest) (*HealthCheckResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method HealthCheck not implemented")
@@ -308,6 +326,24 @@ func _ExportService_ExportAllReportByLocationID_Handler(srv interface{}, ctx con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ExportService_UploadAllPendingFiles_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UploadAllPendingFilesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ExportServiceServer).UploadAllPendingFiles(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ExportService_UploadAllPendingFiles_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ExportServiceServer).UploadAllPendingFiles(ctx, req.(*UploadAllPendingFilesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _ExportService_HealthCheck_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(HealthCheckRequest)
 	if err := dec(in); err != nil {
@@ -356,6 +392,10 @@ var ExportService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ExportAllReportByLocationID",
 			Handler:    _ExportService_ExportAllReportByLocationID_Handler,
+		},
+		{
+			MethodName: "UploadAllPendingFiles",
+			Handler:    _ExportService_UploadAllPendingFiles_Handler,
 		},
 		{
 			MethodName: "HealthCheck",

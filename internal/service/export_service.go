@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"jarvist/sftp-service/internal/config"
@@ -30,11 +31,13 @@ type ExportService interface {
 }
 
 type exportService struct {
-	peopleRepo  repository.PeopleCountRepository
-	sftpLogRepo repository.SFTPLogRepository
-	csvWriter   file.CSVWriter
-	localPath   string
-	jobQueue    queue.JobQueue
+	peopleRepo      repository.PeopleCountRepository
+	sftpLogRepo     repository.SFTPLogRepository
+	csvWriter       file.CSVWriter
+	localPath       string
+	jobQueue        queue.JobQueue
+	processingMutex sync.RWMutex
+	processingFiles map[string]time.Time
 }
 
 // NewExportService creates a new export service with queue integration
@@ -46,11 +49,12 @@ func NewExportService(
 	jobQueue queue.JobQueue,
 ) ExportService {
 	return &exportService{
-		peopleRepo:  peopleRepo,
-		sftpLogRepo: sftpLogRepo,
-		csvWriter:   csvWriter,
-		localPath:   localPath,
-		jobQueue:    jobQueue,
+		peopleRepo:      peopleRepo,
+		sftpLogRepo:     sftpLogRepo,
+		csvWriter:       csvWriter,
+		localPath:       localPath,
+		jobQueue:        jobQueue,
+		processingFiles: make(map[string]time.Time),
 	}
 }
 
@@ -199,8 +203,24 @@ func (s *exportService) getLocations(tenantID string) ([]entity.Location, error)
 // After creating CSV file, it saves log to database and queues upload job
 func (s *exportService) processDailyReport(tenantID string, location entity.Location, date time.Time) error {
 	jakartaTime := date.In(config.GetJakartaTimezone())
+	locationProcessKey := fmt.Sprintf("%s_%s_%s_daily", tenantID, location.ID, jakartaTime.Format("20060102"))
+
 	log.Printf("[DAILY] Processing location %s for date %s (Jakarta: %s)",
 		location.LocationCode, date.Format("2006-01-02"), jakartaTime.Format("2006-01-02 15:04 MST"))
+
+	// Check if this location+date is currently being processed
+	if s.isFileCurrentlyProcessing(locationProcessKey) {
+		log.Printf("[DAILY] Location %s for date %s is currently being processed, skipping",
+			location.LocationCode, date.Format("2006-01-02"))
+		return nil
+	}
+
+	if !s.markFileAsProcessing(locationProcessKey) {
+		log.Printf("[DAILY] Location %s for date %s started processing by another worker, skipping",
+			location.LocationCode, date.Format("2006-01-02"))
+		return nil
+	}
+	defer s.unmarkFileAsProcessing(locationProcessKey)
 
 	// Get reports from database
 	reports, err := s.peopleRepo.GetReport(tenantID, location.ID, date)
@@ -236,8 +256,25 @@ func (s *exportService) processDailyReport(tenantID string, location entity.Loca
 // After creating CSV file, it saves log to database and queues upload job
 func (s *exportService) process30MinReport(tenantID string, location entity.Location, triggerTime time.Time) error {
 	jakartaTriggerTime := triggerTime.In(config.GetJakartaTimezone())
+	currentWindow := jakartaTriggerTime.Truncate(30 * time.Minute)
+
+	locationProcessKey := fmt.Sprintf("%s_%s_%s_30min", tenantID, location.ID, currentWindow.Format("20060102_1504"))
+
 	log.Printf("[30MIN] Processing location %s for trigger time %s (Jakarta: %s)",
 		location.LocationCode, triggerTime.Format("2006-01-02 15:04"), jakartaTriggerTime.Format("2006-01-02 15:04 MST"))
+
+	// Check if this location+window is currently being processed
+	if s.isFileCurrentlyProcessing(locationProcessKey) {
+		log.Printf("[30MIN] Location %s for window %s is currently being processed, skipping", location.LocationCode, currentWindow.Format("15:04"))
+		return nil
+	}
+
+	if !s.markFileAsProcessing(locationProcessKey) {
+		log.Printf("[30MIN] Location %s for window %s started processing by another worker, skipping",
+			location.LocationCode, currentWindow.Format("15:04"))
+		return nil
+	}
+	defer s.unmarkFileAsProcessing(locationProcessKey)
 
 	// Ensure today is in Jakarta timezone
 	today := time.Date(jakartaTriggerTime.Year(), jakartaTriggerTime.Month(), jakartaTriggerTime.Day(), 0, 0, 0, 0, config.GetJakartaTimezone())
@@ -253,8 +290,6 @@ func (s *exportService) process30MinReport(tenantID string, location entity.Loca
 			location.LocationCode, jakartaTriggerTime.Format("15:04"))
 		return nil
 	}
-
-	currentWindow := jakartaTriggerTime.Truncate(30 * time.Minute)
 
 	// Write CSV file
 	filePath, err := s.csvWriter.Write30MinReport(tenantID, location.LocationCode, allReports, currentWindow)
@@ -371,50 +406,125 @@ func (s *exportService) getLocationByID(tenantID, locationID string) (entity.Loc
 	return location, nil
 }
 
+// isFileCurrentlyProcessing checks if file is being processed by another goroutine
+func (s *exportService) isFileCurrentlyProcessing(fileName string) bool {
+	s.processingMutex.RLock()
+	defer s.processingMutex.RUnlock()
+
+	if lastProcessTime, exists := s.processingFiles[fileName]; exists {
+		// If processing started less than 5 minutes ago, consider it active
+		if time.Since(lastProcessTime) < 5*time.Minute {
+			return true
+		}
+		// Clean up old entries
+		delete(s.processingFiles, fileName)
+	}
+	return false
+}
+
+// markFileAsProcessing marks file as currently being processed
+func (s *exportService) markFileAsProcessing(fileName string) bool {
+	s.processingMutex.Lock()
+	defer s.processingMutex.Unlock()
+
+	// Double-check after acquiring write lock
+	if lastProcessTime, exists := s.processingFiles[fileName]; exists {
+		if time.Since(lastProcessTime) < 5*time.Minute {
+			return false // Already being processed
+		}
+	}
+
+	s.processingFiles[fileName] = time.Now()
+	return true
+}
+
+// unmarkFileAsProcessing removes file from processing tracker
+func (s *exportService) unmarkFileAsProcessing(fileName string) {
+	s.processingMutex.Lock()
+	defer s.processingMutex.Unlock()
+	delete(s.processingFiles, fileName)
+}
+
 // saveFileAndQueueUpload saves file information to database with PENDING status
 func (s *exportService) saveFileAndQueueUpload(tenantID, locationID, filePath string) error {
 	fileName := filepath.Base(filePath)
 	fileType := utils.DetermineFileType(fileName)
 
-	// Check if there's already a recent successful upload for this file
+	// 1. Check if file is currently being processed by another goroutine
+	if s.isFileCurrentlyProcessing(fileName) {
+		log.Printf("[EXPORT] File %s is currently being processed by another worker, skipping", fileName)
+		return nil
+	}
+
+	// 2. Mark file as being processed
+	if !s.markFileAsProcessing(fileName) {
+		log.Printf("[EXPORT] File %s started processing by another worker while checking, skipping", fileName)
+		return nil
+	}
+	defer s.unmarkFileAsProcessing(fileName)
+
+	// 3. Check database for recent uploads with more granular timing
 	existingLog, err := s.sftpLogRepo.GetByFileName(fileName)
 	if err != nil {
 		log.Printf("[EXPORT] Failed to check existing log for %s: %v", fileName, err)
 	}
 
-	// Prevent duplicates only for very recent uploads (5 minutes) to avoid accidental rapid fire
-	if existingLog != nil && existingLog.Status == "SUCCESS" {
-		if time.Since(existingLog.CreatedAt) < 5*time.Minute {
-			log.Printf("[EXPORT] File %s already uploaded successfully %.1f minutes ago, skipping to prevent rapid duplicate",
-				fileName, time.Since(existingLog.CreatedAt).Minutes())
-			return nil
-		}
+	// 4. Enhanced duplicate prevention logic
+	if existingLog != nil {
+		timeSinceCreated := time.Since(existingLog.CreatedAt)
 
-		// For older successful uploads, allow repush and log it clearly
-		log.Printf("[EXPORT] File %s was uploaded successfully %.1f minutes ago, proceeding with repush", fileName, time.Since(existingLog.CreatedAt).Minutes())
+		switch existingLog.Status {
+		case "SUCCESS":
+			// Skip if successfully uploaded recently (30 seconds)
+			if timeSinceCreated < 30*time.Second {
+				log.Printf("[EXPORT] File %s was successfully uploaded %.1f seconds ago, skipping duplicate",
+					fileName, timeSinceCreated.Seconds())
+				return nil
+			}
+			// Allow repush for older successful uploads
+			log.Printf("[EXPORT] File %s was uploaded %.1f minutes ago, proceeding with repush",
+				fileName, timeSinceCreated.Minutes())
+
+		case "PENDING":
+			// Skip if pending upload is very recent (10 seconds)
+			if timeSinceCreated < 10*time.Second {
+				log.Printf("[EXPORT] File %s has PENDING upload from %.1f seconds ago, skipping duplicate", fileName, timeSinceCreated.Seconds())
+				return nil
+			}
+			// Continue processing if pending for too long (might be stuck)
+			log.Printf("[EXPORT] File %s has stale PENDING upload from %.1f minutes ago, retrying",
+				fileName, timeSinceCreated.Minutes())
+
+		case "FAILED":
+			// Allow retry for failed uploads, but not too frequently
+			if timeSinceCreated < 30*time.Second {
+				log.Printf("[EXPORT] File %s failed upload %.1f seconds ago, too soon to retry", fileName, timeSinceCreated.Seconds())
+				return nil
+			}
+			log.Printf("[EXPORT] File %s failed upload %.1f minutes ago, proceeding with retry", fileName, timeSinceCreated.Minutes())
+		}
 	}
 
-	// Get tenant configuration to determine the remote path
+	// 5. Get tenant configuration
 	tenantConfig, exists := config.GetTenantByID(tenantID)
 	if !exists {
 		return fmt.Errorf("tenant %s not found or disabled", tenantID)
 	}
 
-	// Get file information
+	// 6. Get file information
 	fileInfo, err := os.Stat(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to get file info: %w", err)
 	}
 
 	recordCount := utils.CountFileRecords(filePath)
-
-	// Create remote path using tenant's base path (normalize to Unix-style path)
 	remotePath := strings.ReplaceAll(filepath.Join(tenantConfig.SFTP.BasePath, fileName), "\\", "/")
 
 	var transferLog *entity.SFTPTransferLog
 
-	if existingLog != nil && existingLog.Status == "PENDING" {
-		// Update existing PENDING log instead of creating new one
+	// 7. Handle existing PENDING logs smartly
+	if existingLog != nil && existingLog.Status == "PENDING" && time.Since(existingLog.CreatedAt) > 10*time.Second {
+		// Update existing stale PENDING log
 		transferLog = existingLog
 		transferLog.FilePath = filePath
 		transferLog.RemotePath = remotePath
@@ -422,16 +532,15 @@ func (s *exportService) saveFileAndQueueUpload(tenantID, locationID, filePath st
 		transferLog.RecordCount = &recordCount
 		transferLog.TransferStartTime = time.Now()
 
-		// Update existing log in database
 		if err := s.sftpLogRepo.Update(transferLog); err != nil {
 			log.Printf("[EXPORT] Failed to update existing PENDING log for %s: %v", fileName, err)
 			return fmt.Errorf("failed to update transfer log: %w", err)
 		}
 
-		log.Printf("[EXPORT] Updated existing PENDING log for %s", fileName)
+		log.Printf("[EXPORT] Updated stale PENDING log for %s (was created %.1f minutes ago)",
+			fileName, time.Since(existingLog.CreatedAt).Minutes())
 	} else {
-		// Create new SFTP transfer log with PENDING status
-		// This handles both initial uploads and repush attempts
+		// 8. Create new log entry with deduplication key
 		transferLog = &entity.SFTPTransferLog{
 			ID:                uuid.New().String(),
 			TenantID:          tenantID,
@@ -447,8 +556,12 @@ func (s *exportService) saveFileAndQueueUpload(tenantID, locationID, filePath st
 			CreatedAt:         time.Now(),
 		}
 
-		// Save log to database
 		if err := s.sftpLogRepo.Create(transferLog); err != nil {
+			// Handle potential duplicate key error gracefully
+			if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique constraint") {
+				log.Printf("[EXPORT] Duplicate log entry detected for %s, another process created it", fileName)
+				return nil
+			}
 			log.Printf("[EXPORT] Failed to create transfer log for %s: %v", fileName, err)
 			return fmt.Errorf("failed to create transfer log: %w", err)
 		}
@@ -457,10 +570,11 @@ func (s *exportService) saveFileAndQueueUpload(tenantID, locationID, filePath st
 		if existingLog != nil {
 			logType = "repush"
 		}
-		log.Printf("[EXPORT] File log created (%s): %s (PENDING) with remote path: %s", logType, fileName, remotePath)
+		log.Printf("[EXPORT] File log created (%s): %s (PENDING) with remote path: %s",
+			logType, fileName, remotePath)
 	}
 
-	// Create upload job for queue
+	// 9. Create upload job with deduplication ID
 	uploadJob := types.UploadSFTPJob{
 		TenantID:   tenantID,
 		FilePath:   filePath,
@@ -471,13 +585,22 @@ func (s *exportService) saveFileAndQueueUpload(tenantID, locationID, filePath st
 		CreatedAt:  time.Now(),
 	}
 
-	// Publish upload job to queue
-	if err := s.jobQueue.PublishJob(types.SubjectUploadSFTP, uploadJob); err != nil {
-		log.Printf("[EXPORT] Failed to publish upload job for %s: %v", fileName, err)
-		return fmt.Errorf("failed to publish upload job: %w", err)
+	// 10. Publish upload job to queue with retry
+	maxRetries := 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if err := s.jobQueue.PublishJob(types.SubjectUploadSFTP, uploadJob); err != nil {
+			log.Printf("[EXPORT] Failed to publish upload job for %s (attempt %d/%d): %v",
+				fileName, attempt, maxRetries, err)
+			if attempt == maxRetries {
+				return fmt.Errorf("failed to publish upload job after %d attempts: %w", maxRetries, err)
+			}
+			time.Sleep(time.Duration(attempt) * time.Second)
+			continue
+		}
+		break
 	}
 
-	log.Printf("[EXPORT] Upload job queued: %s", fileName)
+	log.Printf("[EXPORT] Upload job queued: %s (log ID: %s)", fileName, transferLog.ID)
 	return nil
 }
 

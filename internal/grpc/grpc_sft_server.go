@@ -17,11 +17,13 @@ import (
 type SFTPGRPCServer struct {
 	pb.UnimplementedExportServiceServer
 	exportService service.ExportService
+	sftService    service.SFTPService
 }
 
-func NewSFTPGRPCServer(exportService service.ExportService) *SFTPGRPCServer {
+func NewSFTPGRPCServer(exportService service.ExportService, sftService service.SFTPService) *SFTPGRPCServer {
 	return &SFTPGRPCServer{
 		exportService: exportService,
+		sftService:    sftService,
 	}
 }
 
@@ -205,6 +207,28 @@ func (s *SFTPGRPCServer) ExportAllReportByLocationID(ctx context.Context, req *p
 	return &pb.ExportResponse{
 		Success: true,
 		Message: "Complete export by location completed successfully",
+	}, nil
+}
+
+func (s *SFTPGRPCServer) UploadAllPendingFiles(ctx context.Context, req *pb.UploadAllPendingFilesRequest) (*pb.ExportResponse, error) {
+	log.Printf("[GRPC] UploadAllPendingFiles request received for tenant: %s", req.TenantId)
+
+	if err := s.validateTenantID(req.TenantId); err != nil {
+		return nil, err
+	}
+
+	if err := s.sftService.UploadAllPendingFiles(req.TenantId); err != nil {
+		log.Printf("[GRPC] UploadAllPendingFiles failed for tenant %s: %v", req.TenantId, err)
+		return &pb.ExportResponse{
+			Success: false,
+			Message: fmt.Sprintf("Export failed: %v", err),
+		}, nil
+	}
+
+	log.Printf("[GRPC] UploadAllPendingFiles completed successfully for tenant: %s", req.TenantId)
+	return &pb.ExportResponse{
+		Success: true,
+		Message: "Upload all pending files completed successfully",
 	}, nil
 }
 
