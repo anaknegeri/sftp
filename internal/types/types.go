@@ -1,22 +1,23 @@
 package types
 
-import "time"
+import (
+	"time"
+)
 
-// Subject constants yang sesuai dengan format baru NATS
 const (
 	SubjectGenerateReport = "job.sftp.generate.report"
 	SubjectUploadSFTP     = "job.sftp.upload.sftp"
-	SubjectLateDataCheck  = "job.sftp.late.data.check" // NEW
+	SubjectLateDataCheck  = "job.sftp.late.data.check"
 )
 
-// Job type constants untuk NATS subject mapping
+// Job type constants
 const (
 	JobTypeGenerateReport = "generate_report"
 	JobTypeUploadSFTP     = "upload_sftp"
 	JobTypeDailyExport    = "daily_export"
 	JobType30MinExport    = "30min_export"
 	JobTypeRepush         = "repush"
-	JobTypeLateDataCheck  = "late_data_check" // NEW
+	JobTypeLateDataCheck  = "late_data_check"
 )
 
 type GenerateReportJob struct {

@@ -1,210 +1,294 @@
 package queue
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
+	"jarvist/sftp-service/internal/config"
 	"log"
 	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream"
 )
 
-type JobQueue interface {
-	PublishJob(subject string, job interface{}) error
-	SubscribeJob(subject string, handler JobHandler) error
-	Close() error
-}
-
-type JobHandler func(data []byte) error
-
-type natsJobQueue struct {
-	conn *nats.Conn
-	js   jetstream.JetStream
-}
-
-// Constants yang tepat sesuai referensi
 const (
-	StreamName   = "SFTP_JOBS"
-	SubjectJobs  = "sftp.jobs.*"
-	ConsumerName = "job-worker"
+	SubjectGenerateReport = "jarvist.sftp.generate.report"
+	SubjectUploadSFTP     = "jarvist.sftp.upload.sftp"
+	SubjectLateDataCheck  = "jarvist.sftp.late.data.check"
 )
+
+type NATSQueue struct {
+	nc     *nats.Conn
+	js     nats.JetStreamContext
+	config config.NATSConfig
+}
 
 func NewJobQueue(natsURL string) (JobQueue, error) {
-	log.Printf("[QUEUE] Connecting to NATS at %s", natsURL)
+	cfg := config.NATSConfig{
+		URL:            natsURL,
+		StreamName:     "JARVIST_SFTP_JOBS",
+		ConnectTimeout: 30,
+		ReconnectWait:  2,
+		MaxReconnects:  -1,
+		MaxAge:         72, // hours
+		MaxMessages:    100000,
+		MaxBytes:       1024 * 1024 * 1024, // 1GB
+	}
 
-	// Simple connection seperti referensi
-	conn, err := nats.Connect(natsURL)
+	// Connection options
+	opts := []nats.Option{
+		nats.Name("jarvist-sftp-service"),
+		nats.ReconnectWait(time.Duration(cfg.ReconnectWait) * time.Second),
+		nats.MaxReconnects(cfg.MaxReconnects),
+		nats.Timeout(time.Duration(cfg.ConnectTimeout) * time.Second),
+		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
+			log.Printf("[QUEUE] NATS disconnected: %v", err)
+		}),
+		nats.ReconnectHandler(func(nc *nats.Conn) {
+			log.Printf("[QUEUE] NATS reconnected to %s", nc.ConnectedUrl())
+		}),
+		nats.ClosedHandler(func(nc *nats.Conn) {
+			log.Println("[QUEUE] NATS connection closed")
+		}),
+	}
+
+	// Connect dengan retry
+	var nc *nats.Conn
+	var err error
+	for attempt := 1; attempt <= 5; attempt++ {
+		nc, err = nats.Connect(cfg.URL, opts...)
+		if err == nil {
+			break
+		}
+		log.Printf("[QUEUE] Connection attempt %d failed: %v", attempt, err)
+		time.Sleep(time.Duration(attempt) * time.Second)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to NATS: %w", err)
 	}
 
-	log.Printf("[QUEUE] Connected to NATS: %s", conn.ConnectedUrl())
-
 	// Create JetStream context
-	js, err := jetstream.New(conn)
+	js, err := nc.JetStream()
 	if err != nil {
+		nc.Close()
 		return nil, fmt.Errorf("failed to create JetStream: %w", err)
 	}
 
-	queue := &natsJobQueue{
-		conn: conn,
-		js:   js,
+	queue := &NATSQueue{
+		nc:     nc,
+		js:     js,
+		config: cfg,
 	}
 
-	// Setup stream dengan handling conflict
+	// Setup stream
 	if err := queue.setupStream(); err != nil {
+		nc.Close()
 		return nil, fmt.Errorf("failed to setup stream: %w", err)
 	}
 
-	log.Printf("[QUEUE] NATS queue initialized successfully")
+	log.Printf("[QUEUE] NATS queue initialized, stream: %s", cfg.StreamName)
 	return queue, nil
 }
 
-func (q *natsJobQueue) setupStream() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+func (q *NATSQueue) setupStream() error {
+	// First, check if there are existing streams that might conflict
+	streams := q.js.StreamNames()
+	conflictingStreams := []string{}
 
-	log.Printf("[QUEUE] Setting up stream: %s", StreamName)
-
-	// Check if our stream already exists with correct config
-	if stream, err := q.js.Stream(ctx, StreamName); err == nil {
-		if info, err := stream.Info(ctx); err == nil {
-			log.Printf("[QUEUE] Stream %s already exists with subjects: %v",
-				StreamName, info.Config.Subjects)
-			return nil
+	for streamName := range streams {
+		if streamName != q.config.StreamName {
+			streamInfo, err := q.js.StreamInfo(streamName)
+			if err == nil {
+				for _, subject := range streamInfo.Config.Subjects {
+					// Check for overlapping subjects
+					if strings.HasPrefix(subject, "jarvist.sftp.") ||
+						strings.Contains(subject, "jarvist.sftp.>") ||
+						subject == "jarvist.sftp.>" {
+						conflictingStreams = append(conflictingStreams, streamName)
+						break
+					}
+				}
+			}
 		}
 	}
 
-	// Create stream dengan config minimal seperti referensi
-	streamConfig := jetstream.StreamConfig{
-		Name:     StreamName,
-		Subjects: []string{SubjectJobs},
-		Storage:  jetstream.FileStorage,
-		MaxAge:   24 * time.Hour,
-		MaxMsgs:  1000,
+	if len(conflictingStreams) > 0 {
+		log.Printf("[QUEUE] Found conflicting streams: %v", conflictingStreams)
+		log.Printf("[QUEUE] You may need to delete these streams or use different subjects")
+
+		for _, streamName := range conflictingStreams {
+			err := q.js.DeleteStream(streamName)
+			if err != nil {
+				log.Printf("[QUEUE] Failed to delete conflicting stream %s: %v", streamName, err)
+			} else {
+				log.Printf("[QUEUE] Deleted conflicting stream: %s", streamName)
+			}
+		}
 	}
 
-	_, err := q.js.CreateOrUpdateStream(ctx, streamConfig)
+	// Try to get existing stream first
+	existingStream, err := q.js.StreamInfo(q.config.StreamName)
+	if err == nil {
+		log.Printf("[QUEUE] Stream already exists: %s", q.config.StreamName)
+
+		// Check if subjects match what we expect
+		expectedSubjects := []string{
+			SubjectGenerateReport,
+			SubjectUploadSFTP,
+			SubjectLateDataCheck,
+		}
+
+		currentSubjects := existingStream.Config.Subjects
+		log.Printf("[QUEUE] Current subjects: %v", currentSubjects)
+		log.Printf("[QUEUE] Expected subjects: %v", expectedSubjects)
+
+		// If subjects don't match, try to update
+		subjectsMatch := len(currentSubjects) == len(expectedSubjects)
+		if subjectsMatch {
+			for i, subject := range expectedSubjects {
+				if i >= len(currentSubjects) || currentSubjects[i] != subject {
+					subjectsMatch = false
+					break
+				}
+			}
+		}
+
+		if !subjectsMatch {
+			log.Printf("[QUEUE] Subjects don't match, attempting to update stream")
+			return q.updateStreamSubjects(expectedSubjects)
+		}
+
+		return nil
+	}
+
+	// Create new stream with specific subjects instead of wildcard
+	streamConfig := &nats.StreamConfig{
+		Name:        q.config.StreamName,
+		Description: "JARVIST SFTP Service Message Stream",
+		Subjects: []string{
+			SubjectGenerateReport,
+			SubjectUploadSFTP,
+			SubjectLateDataCheck,
+		},
+		Retention:  nats.WorkQueuePolicy,
+		MaxAge:     time.Duration(q.config.MaxAge) * time.Hour,
+		MaxMsgs:    q.config.MaxMessages,
+		MaxBytes:   q.config.MaxBytes,
+		Storage:    nats.FileStorage,
+		Duplicates: 2 * time.Minute,
+		Discard:    nats.DiscardOld,
+	}
+
+	_, err = q.js.AddStream(streamConfig)
 	if err != nil {
+		// If still failing due to overlap, provide more specific error information
+		if strings.Contains(err.Error(), "subjects overlap") {
+			return fmt.Errorf("subjects overlap with existing stream. Current subjects: %v. Error: %w",
+				streamConfig.Subjects, err)
+		}
 		return fmt.Errorf("failed to create stream: %w", err)
 	}
 
-	log.Printf("[QUEUE] Stream %s created successfully", StreamName)
+	log.Printf("[QUEUE] Created new stream: %s with subjects: %v", q.config.StreamName, streamConfig.Subjects)
 	return nil
 }
 
-func (q *natsJobQueue) PublishJob(subject string, job interface{}) error {
-	data, err := json.Marshal(job)
-	if err != nil {
-		return fmt.Errorf("failed to marshal job: %w", err)
+func (q *NATSQueue) updateStreamSubjects(subjects []string) error {
+	streamConfig := &nats.StreamConfig{
+		Name:        q.config.StreamName,
+		Description: "JARVIST SFTP Service Message Stream",
+		Subjects:    subjects,
+		Retention:   nats.WorkQueuePolicy,
+		MaxAge:      time.Duration(q.config.MaxAge) * time.Hour,
+		MaxMsgs:     q.config.MaxMessages,
+		MaxBytes:    q.config.MaxBytes,
+		Storage:     nats.FileStorage,
+		Duplicates:  2 * time.Minute,
+		Discard:     nats.DiscardOld,
 	}
 
-	// Convert subject format
-	natsSubject := q.convertToNATSSubject(subject)
-
-	log.Printf("[QUEUE] Publishing job to subject: %s (data size: %d bytes)", natsSubject, len(data))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	ack, err := q.js.Publish(ctx, natsSubject, data)
+	_, err := q.js.UpdateStream(streamConfig)
 	if err != nil {
-		return fmt.Errorf("failed to publish job: %w", err)
+		return fmt.Errorf("failed to update stream subjects: %w", err)
 	}
 
-	log.Printf("[QUEUE] Job published successfully, sequence: %d, stream: %s", ack.Sequence, ack.Stream)
+	log.Printf("[QUEUE] Updated stream: %s with subjects: %v", q.config.StreamName, subjects)
 	return nil
 }
 
-func (q *natsJobQueue) SubscribeJob(subject string, handler JobHandler) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// Convert expected subject untuk filtering
-	expectedSubject := q.convertToNATSSubject(subject)
-
-	log.Printf("[QUEUE] Setting up subscription for subject: %s (NATS subject: %s)", subject, expectedSubject)
-
-	// Create consumer dengan pattern seperti referensi
-	consumerName := fmt.Sprintf("%s-%s", ConsumerName, strings.ReplaceAll(subject, ".", "-"))
-	consumerConfig := jetstream.ConsumerConfig{
-		Name:          consumerName,
-		FilterSubject: expectedSubject, // Filter to specific subject instead of wildcard
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		MaxDeliver:    3,
-		AckWait:       30 * time.Second, // Reduced from 10 minutes
-		ReplayPolicy:  jetstream.ReplayInstantPolicy,
+func (q *NATSQueue) PublishJob(subject string, job interface{}) error {
+	// Create message envelope
+	message := map[string]interface{}{
+		"type":        subject,
+		"payload":     job,
+		"enqueued_at": time.Now(),
+		"id":          fmt.Sprintf("%s_%d", subject, time.Now().UnixNano()),
 	}
 
-	log.Printf("[QUEUE] Creating consumer: %s with filter: %s", consumerName, expectedSubject)
-
-	consumer, err := q.js.CreateOrUpdateConsumer(ctx, StreamName, consumerConfig)
+	data, err := json.Marshal(message)
 	if err != nil {
-		return fmt.Errorf("failed to create consumer: %w", err)
+		return fmt.Errorf("failed to marshal message: %w", err)
 	}
 
-	log.Printf("[QUEUE] Consumer created successfully: %s", consumerName)
+	// Convert subject
+	natsSubject := q.getSubjectForTaskType(subject)
 
-	// Start consuming with detailed logging
-	_, err = consumer.Consume(func(msg jetstream.Msg) {
-		msgSubject := msg.Subject()
+	// Generate unique message ID
+	msgID := fmt.Sprintf("%s_%d_%d",
+		subject,
+		time.Now().Unix(),
+		time.Now().UnixNano())
 
-		log.Printf("[QUEUE] Received message from subject: %s (expected: %s)", msgSubject, expectedSubject)
-		log.Printf("[QUEUE] Message headers: %v", msg.Headers())
-		log.Printf("[QUEUE] Message data size: %d bytes", len(msg.Data()))
-
-		// Process the message since we're already filtering by subject in consumer
-		log.Printf("[QUEUE] Processing job from subject: %s", msgSubject)
-
-		startTime := time.Now()
-		if err := handler(msg.Data()); err != nil {
-			duration := time.Since(startTime)
-			log.Printf("[QUEUE] Job processing failed after %v: %v", duration, err)
-			msg.Nak()
-			return
-		}
-
-		duration := time.Since(startTime)
-		msg.Ack()
-		log.Printf("[QUEUE] Job processed successfully in %v", duration)
-	}, jetstream.ConsumeErrHandler(func(consumeCtx jetstream.ConsumeContext, err error) {
-		log.Printf("[QUEUE] Consumer error for %s: %v", consumerName, err)
-	}))
-
+	// Publish
+	_, err = q.js.Publish(natsSubject, data, nats.MsgId(msgID))
 	if err != nil {
-		return fmt.Errorf("failed to start consuming: %w", err)
+		return fmt.Errorf("failed to publish to %s: %w", natsSubject, err)
 	}
 
-	log.Printf("[QUEUE] Subscribed successfully to subject: %s (consumer: %s)", expectedSubject, consumerName)
+	log.Printf("[QUEUE] Published job: %s", subject)
 	return nil
 }
 
-func (q *natsJobQueue) convertToNATSSubject(oldSubject string) string {
-	switch oldSubject {
+func (q *NATSQueue) getSubjectForTaskType(taskType string) string {
+	switch taskType {
 	case "job.sftp.generate.report":
-		return "sftp.jobs.generate_report"
+		return SubjectGenerateReport
 	case "job.sftp.upload.sftp":
-		return "sftp.jobs.upload_sftp"
+		return SubjectUploadSFTP
 	case "job.sftp.late.data.check":
-		return "sftp.jobs.late_data_check"
+		return SubjectLateDataCheck
 	default:
-		// Generic conversion
-		parts := strings.Split(oldSubject, ".")
-		if len(parts) >= 3 {
-			jobType := strings.Join(parts[2:], "_")
-			return fmt.Sprintf("sftp.jobs.%s", jobType)
-		}
-		return fmt.Sprintf("sftp.jobs.%s", strings.ReplaceAll(oldSubject, ".", "_"))
+		log.Printf("[QUEUE] Unknown task type: %s", taskType)
+		return "jarvist.sftp.unknown"
 	}
 }
 
-func (q *natsJobQueue) Close() error {
-	if q.conn != nil {
-		q.conn.Close()
-		log.Println("[QUEUE] NATS connection closed")
+// Helper method to list and inspect existing streams for debugging
+func (q *NATSQueue) ListStreams() error {
+	streams := q.js.StreamNames()
+	log.Printf("[QUEUE] Listing all streams:")
+
+	for streamName := range streams {
+		streamInfo, err := q.js.StreamInfo(streamName)
+		if err != nil {
+			log.Printf("[QUEUE] Failed to get info for stream %s: %v", streamName, err)
+			continue
+		}
+
+		log.Printf("[QUEUE] Stream: %s, Subjects: %v", streamName, streamInfo.Config.Subjects)
 	}
+
+	return nil
+}
+
+func (q *NATSQueue) Close() error {
+	log.Println("[QUEUE] Closing NATS queue")
+
+	if q.nc != nil && q.nc.IsConnected() {
+		q.nc.Close()
+	}
+
+	log.Println("[QUEUE] NATS queue closed")
 	return nil
 }

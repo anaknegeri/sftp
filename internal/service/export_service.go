@@ -2,19 +2,20 @@ package service
 
 import (
 	"fmt"
-	"jarvist/sftp/internal/config"
-	"jarvist/sftp/internal/domain/entity"
-	"jarvist/sftp/internal/file"
-	"jarvist/sftp/internal/queue"
-	"jarvist/sftp/internal/repository"
-	"jarvist/sftp/internal/types"
-	"jarvist/sftp/pkg/utils"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"jarvist/sftp-service/internal/config"
+	"jarvist/sftp-service/internal/domain/entity"
+	"jarvist/sftp-service/internal/file"
+	"jarvist/sftp-service/internal/queue"
+	"jarvist/sftp-service/internal/repository"
+	"jarvist/sftp-service/internal/types"
+	"jarvist/sftp-service/pkg/utils"
 
 	"github.com/google/uuid"
 )
@@ -212,15 +213,6 @@ func (s *exportService) processDailyReport(tenantID string, location entity.Loca
 		return nil
 	}
 
-	// Debug log to check timezone from database
-	if len(reports) > 0 {
-		firstReport := reports[0]
-		if reportTime, err := time.Parse(time.RFC3339, firstReport.Date); err == nil {
-			log.Printf("[DEBUG] First report time from DB: %s (timezone: %s)",
-				firstReport.Date, reportTime.Location().String())
-		}
-	}
-
 	// Write CSV file
 	filePath, err := s.csvWriter.WriteDailyReport(tenantID, location.LocationCode, reports, date)
 	if err != nil {
@@ -249,7 +241,6 @@ func (s *exportService) process30MinReport(tenantID string, location entity.Loca
 
 	// Ensure today is in Jakarta timezone
 	today := time.Date(jakartaTriggerTime.Year(), jakartaTriggerTime.Month(), jakartaTriggerTime.Day(), 0, 0, 0, 0, config.GetJakartaTimezone())
-	log.Printf("[DEBUG] Today range: %s (Jakarta)", today.Format("2006-01-02 15:04 MST"))
 
 	// Get reports within time range
 	allReports, err := s.peopleRepo.GetReportWithTimeRange(tenantID, location.ID, today, triggerTime)
@@ -531,8 +522,6 @@ func (s *exportService) filterCumulativeDataUpToWindow(allReports []entity.Daily
 
 	// Convert windowTime to Jakarta timezone for comparison
 	jakartaWindowTime := windowTime.In(config.GetJakartaTimezone())
-	log.Printf("[DEBUG] Filtering reports up to window: %s (Jakarta)", jakartaWindowTime.Format("2006-01-02 15:04 MST"))
-
 	for _, report := range allReports {
 		reportTime, err := time.Parse(time.RFC3339, report.Date)
 		if err != nil {
@@ -548,7 +537,6 @@ func (s *exportService) filterCumulativeDataUpToWindow(allReports []entity.Daily
 		}
 	}
 
-	log.Printf("[DEBUG] Filtered %d reports from %d total reports", len(cumulativeReports), len(allReports))
 	return cumulativeReports
 }
 

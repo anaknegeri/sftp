@@ -2,14 +2,15 @@ package scheduler
 
 import (
 	"fmt"
-	"jarvist/sftp/internal/config"
-	"jarvist/sftp/internal/queue"
-	"jarvist/sftp/internal/service"
-	"jarvist/sftp/internal/types"
 	"log"
 	"os"
 	"path/filepath"
 	"time"
+
+	"jarvist/sftp-service/internal/config"
+	"jarvist/sftp-service/internal/queue"
+	"jarvist/sftp-service/internal/service"
+	"jarvist/sftp-service/internal/types"
 
 	"github.com/robfig/cron/v3"
 )

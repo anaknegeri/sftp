@@ -2,18 +2,19 @@ package service
 
 import (
 	"fmt"
-	"jarvist/sftp/internal/config"
-	"jarvist/sftp/internal/domain/entity"
-	"jarvist/sftp/internal/file"
-	"jarvist/sftp/internal/repository"
-	"jarvist/sftp/internal/types"
-	"jarvist/sftp/pkg/utils"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"jarvist/sftp-service/internal/config"
+	"jarvist/sftp-service/internal/domain/entity"
+	"jarvist/sftp-service/internal/file"
+	"jarvist/sftp-service/internal/repository"
+	"jarvist/sftp-service/internal/types"
+	"jarvist/sftp-service/pkg/utils"
 
 	"github.com/google/uuid"
 )
@@ -54,6 +55,13 @@ func (s *lateDataService) CheckForLateData(tenantID string, checkDate time.Time,
 	log.Printf("[LATE_DATA] Starting %s late data check for tenant %s, date %s",
 		checkType, tenantID, checkDate.Format("2006-01-02"))
 
+	// TAMBAHAN: Validasi checkType di awal dengan debug info
+	if err := s.validateCheckType(checkType); err != nil {
+		log.Printf("[LATE_DATA] Invalid check type received: '%s' (len: %d, bytes: %v)",
+			checkType, len(checkType), []byte(checkType))
+		return err
+	}
+
 	locations, err := s.peopleRepo.GetLocations(tenantID)
 	if err != nil {
 		return fmt.Errorf("failed to get locations: %w", err)
@@ -66,7 +74,7 @@ func (s *lateDataService) CheckForLateData(tenantID string, checkDate time.Time,
 
 	processedCount := 0
 	for _, location := range locations {
-		switch checkType {
+		switch strings.TrimSpace(checkType) { // TAMBAHAN: TrimSpace untuk handle whitespace
 		case "realtime":
 			// For realtime checks - check for very recent late data
 			if s.hasRecentLateData(tenantID, location, checkDate) {
@@ -86,8 +94,9 @@ func (s *lateDataService) CheckForLateData(tenantID string, checkDate time.Time,
 				processedCount++
 			}
 		default:
-			log.Printf("[LATE_DATA] Unknown check type: %s", checkType)
-			continue
+			log.Printf("[LATE_DATA] Unknown check type: '%s' (after trim: '%s', len: %d, bytes: %v)",
+				checkType, strings.TrimSpace(checkType), len(checkType), []byte(checkType))
+			return fmt.Errorf("unknown check type: %s", checkType) // TAMBAHAN: Return error instead of continue
 		}
 	}
 
@@ -99,6 +108,19 @@ func (s *lateDataService) CheckForLateData(tenantID string, checkDate time.Time,
 	}
 
 	return nil
+}
+
+func (s *lateDataService) validateCheckType(checkType string) error {
+	validTypes := []string{"realtime", "historical"}
+
+	trimmedType := strings.TrimSpace(checkType)
+	for _, valid := range validTypes {
+		if trimmedType == valid {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("invalid check type '%s', must be one of: %v", checkType, validTypes)
 }
 
 // Check for recent late data (within last hour)

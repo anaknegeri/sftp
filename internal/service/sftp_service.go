@@ -1,17 +1,20 @@
 package service
 
 import (
+	"context"
 	"fmt"
-	"jarvist/sftp/internal/config"
-	"jarvist/sftp/internal/domain/entity"
-	"jarvist/sftp/internal/repository"
-	"jarvist/sftp/internal/types"
-	"jarvist/sftp/pkg/utils"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"jarvist/sftp-service/internal/config"
+	"jarvist/sftp-service/internal/domain/entity"
+	"jarvist/sftp-service/internal/repository"
+	"jarvist/sftp-service/internal/types"
+	"jarvist/sftp-service/pkg/utils"
 
 	"github.com/google/uuid"
 	"github.com/pkg/sftp"
@@ -57,10 +60,6 @@ func (s *sftpService) UploadFile(job types.UploadSFTPJob) error {
 		transferLog = existingLog
 		transferLog.TransferStartTime = time.Now()
 		log.Printf("[SFTP] Using existing PENDING log for file %s (ID: %s)", job.FileName, transferLog.ID)
-	} else if existingLog != nil && existingLog.Status == "SUCCESS" {
-		// File already uploaded successfully
-		log.Printf("[SFTP] File %s already uploaded successfully, skipping", job.FileName)
-		return nil
 	} else {
 		// Create new log
 		transferLog = &entity.SFTPTransferLog{
@@ -152,19 +151,6 @@ func (s *sftpService) UploadAllPendingFiles(tenantID string) error {
 	successCount := 0
 	for _, filePath := range files {
 		fileName := filepath.Base(filePath)
-
-		// Check if file was already uploaded successfully
-		existingLog, err := s.sftpLogRepo.GetByFileName(fileName)
-		if err != nil {
-			log.Printf("[SFTP] Failed to check existing log for %s: %v", fileName, err)
-			continue
-		}
-
-		if existingLog != nil && existingLog.Status == "SUCCESS" {
-			log.Printf("[SFTP] File %s already uploaded successfully, skipping", fileName)
-			continue
-		}
-
 		// Create upload job
 		fileType := utils.DetermineFileType(fileName)
 
@@ -175,7 +161,7 @@ func (s *sftpService) UploadAllPendingFiles(tenantID string) error {
 			continue
 		}
 
-		// Use forward slashes for remote path (Unix-style)
+		// Use forward slashes for remote path
 		remotePath := strings.ReplaceAll(filepath.Join(tenantConfig.SFTP.BasePath, fileName), "\\", "/")
 
 		uploadJob := types.UploadSFTPJob{
@@ -208,12 +194,15 @@ func (s *sftpService) performUpload(sftpConfig config.SFTPConfig, localPath, rem
 
 	// Create SSH client config
 	sshConfig := &ssh.ClientConfig{
-		User: sftpConfig.User,
-		Auth: []ssh.AuthMethod{
-			ssh.Password(sftpConfig.Password),
-		},
+		User:            sftpConfig.User,
+		Auth:            []ssh.AuthMethod{},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // Use proper host key verification in production
-		Timeout:         30 * time.Second,
+		Timeout:         15 * time.Second,            // Increased timeout like in infrastructure code
+	}
+
+	// Add authentication methods
+	if sftpConfig.Password != "" {
+		sshConfig.Auth = append(sshConfig.Auth, ssh.Password(sftpConfig.Password))
 	}
 
 	// If key path is provided, use key authentication
@@ -228,14 +217,25 @@ func (s *sftpService) performUpload(sftpConfig config.SFTPConfig, localPath, rem
 			return fmt.Errorf("failed to parse private key: %w", err)
 		}
 
-		sshConfig.Auth = []ssh.AuthMethod{ssh.PublicKeys(signer)}
+		sshConfig.Auth = append(sshConfig.Auth, ssh.PublicKeys(signer))
 	}
 
-	// Connect to SSH server
-	addr := fmt.Sprintf("%s:%s", sftpConfig.Host, sftpConfig.Port)
-	sshClient, err := ssh.Dial("tcp", addr, sshConfig)
-	if err != nil {
-		return fmt.Errorf("failed to connect to SSH server: %w", err)
+	// Connect to SSH server with retry logic (like infrastructure code)
+	var sshClient *ssh.Client
+	var err error
+	maxRetries := 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		addr := fmt.Sprintf("%s:%s", sftpConfig.Host, sftpConfig.Port)
+		sshClient, err = ssh.Dial("tcp", addr, sshConfig)
+		if err == nil {
+			break
+		}
+
+		if attempt < maxRetries {
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			continue
+		}
+		return fmt.Errorf("SSH connection failed after %d attempts: %w", maxRetries, err)
 	}
 	defer sshClient.Close()
 
@@ -259,31 +259,114 @@ func (s *sftpService) performUpload(sftpConfig config.SFTPConfig, localPath, rem
 		remoteDir = strings.ReplaceAll(remoteDir, "\\", "/")
 		log.Printf("[SFTP] Creating remote directory: %s", remoteDir)
 
-		// Try to create directory, but don't fail if it already exists
-		if err := sftpClient.MkdirAll(remoteDir); err != nil {
-			// Check if it's a permission error or if directory already exists
-			if _, statErr := sftpClient.Stat(remoteDir); statErr != nil {
+		// Check if directory exists first
+		if _, err := sftpClient.Stat(remoteDir); err != nil {
+			// Directory doesn't exist, try to create it
+			if err := sftpClient.MkdirAll(remoteDir); err != nil {
 				return fmt.Errorf("failed to create remote directory %s: %w", remoteDir, err)
 			}
-			log.Printf("[SFTP] Directory %s already exists or permission issue, continuing...", remoteDir)
 		}
 	}
 
-	// Create remote file
-	remoteFile, err := sftpClient.Create(remotePath)
+	// Create remote file using OpenFile with proper flags (like infrastructure code)
+	var remoteFile *sftp.File
+
+	// Try OpenFile with flags that are more compatible
+	remoteFile, err = sftpClient.OpenFile(remotePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
-		return fmt.Errorf("failed to create remote file %s: %w", remotePath, err)
+		// If still fails, try with different flags
+		log.Printf("[SFTP] OpenFile with TRUNC failed: %v, trying without TRUNC", err)
+		remoteFile, err = sftpClient.OpenFile(remotePath, os.O_WRONLY|os.O_CREATE)
+		if err != nil {
+			// If connection error, this might need reconnection handling
+			if utils.IsConnectionError(err) {
+				return fmt.Errorf("connection error while creating file %s: %w", remotePath, err)
+			}
+			return fmt.Errorf("failed to create remote file %s: %w", remotePath, err)
+		}
+
+		// If we opened without TRUNC, we need to truncate manually
+		if err := remoteFile.Truncate(0); err != nil {
+			remoteFile.Close()
+			return fmt.Errorf("failed to truncate remote file %s: %w", remotePath, err)
+		}
 	}
 	defer remoteFile.Close()
 
-	// Copy file content
-	_, err = remoteFile.ReadFrom(localFile)
+	// Create context with timeout for the upload (like infrastructure code)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Copy file content with timeout and progress monitoring
+	err = s.copyFileWithTimeout(ctx, remoteFile, localFile)
 	if err != nil {
 		return fmt.Errorf("failed to upload file: %w", err)
 	}
 
 	log.Printf("[SFTP] File uploaded successfully: %s -> %s", localPath, remotePath)
 	return nil
+}
+
+func (s *sftpService) copyFileWithTimeout(ctx context.Context, dst io.Writer, src io.Reader) error {
+	buffer := make([]byte, 32*1024) // 32KB buffer
+	totalBytes := int64(0)
+	lastProgressTime := time.Now()
+
+	// Create a channel to track copy completion
+	done := make(chan error, 1)
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				done <- ctx.Err()
+				return
+			default:
+				// Set read deadline on source if possible
+				if conn, ok := src.(*os.File); ok {
+					conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+				}
+
+				n, err := src.Read(buffer)
+				if err != nil {
+					if err == io.EOF {
+						done <- nil // Success
+						return
+					}
+					done <- fmt.Errorf("read error: %w", err)
+					return
+				}
+
+				if n > 0 {
+					written, writeErr := dst.Write(buffer[:n])
+					if writeErr != nil {
+						done <- fmt.Errorf("write error: %w", writeErr)
+						return
+					}
+
+					totalBytes += int64(written)
+
+					// Log progress every 10 seconds
+					if time.Since(lastProgressTime) > 10*time.Second {
+						log.Printf("[SFTP] Upload progress: %d bytes transferred", totalBytes)
+						lastProgressTime = time.Now()
+					}
+				}
+			}
+		}
+	}()
+
+	// Wait for completion or timeout
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("upload timeout after 5 minutes")
+	case err := <-done:
+		if err != nil {
+			return err
+		}
+		log.Printf("[SFTP] Upload completed successfully: %d bytes transferred", totalBytes)
+		return nil
+	}
 }
 
 func (s *sftpService) getRetryDelay(attempt int, err error) time.Duration {

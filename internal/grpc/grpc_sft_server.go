@@ -3,10 +3,11 @@ package grpc
 import (
 	"context"
 	"fmt"
-	"jarvist/sftp/internal/service"
-	pb "jarvist/sftp/pkg/pb"
 	"log"
 	"time"
+
+	"jarvist/sftp-service/internal/service"
+	pb "jarvist/sftp-service/proto/sftp"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -222,11 +223,11 @@ func (s *SFTPGRPCServer) validateLocationID(locationID string) error {
 	return nil
 }
 
-// validateLocationExists validates that location exists for the tenant
-func (s *SFTPGRPCServer) validateLocationExists(tenantID, locationID string) error {
-	// This validation will be handled by the service layer
-	// which has more efficient database access
-	return nil
+func (s *SFTPGRPCServer) HealthCheck(ctx context.Context, req *pb.HealthCheckRequest) (*pb.HealthCheckResponse, error) {
+	return &pb.HealthCheckResponse{
+		Ok:      true,
+		Message: "SFTP server is healthy",
+	}, nil
 }
 
 // Helper function to convert time to timestamp

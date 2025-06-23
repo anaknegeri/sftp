@@ -1,18 +1,18 @@
+// File: cmd/app/main.go
 package main
 
 import (
-	"context"
 	"fmt"
-	"jarvist/sftp/internal/config"
-	databse "jarvist/sftp/internal/database"
-	"jarvist/sftp/internal/file"
-	grpcHandler "jarvist/sftp/internal/grpc"
-	"jarvist/sftp/internal/job"
-	"jarvist/sftp/internal/queue"
-	"jarvist/sftp/internal/repository"
-	"jarvist/sftp/internal/scheduler"
-	"jarvist/sftp/internal/service"
-	pb "jarvist/sftp/pkg/pb"
+	"jarvist/sftp-service/internal/config"
+	"jarvist/sftp-service/internal/database"
+	"jarvist/sftp-service/internal/file"
+	grpcHandler "jarvist/sftp-service/internal/grpc"
+	"jarvist/sftp-service/internal/queue"
+	"jarvist/sftp-service/internal/repository"
+	"jarvist/sftp-service/internal/scheduler"
+	"jarvist/sftp-service/internal/service"
+	"jarvist/sftp-service/internal/worker"
+	pb "jarvist/sftp-service/proto/sftp"
 	"log"
 	"net"
 	"os"
@@ -29,35 +29,36 @@ func main() {
 
 	// Load configuration
 	cfg := config.Load()
-	log.Printf("Configuration loaded - NATS URL: %s, GRPC Port: %s", cfg.NATSURL, cfg.GRPCPort)
+	log.Printf("Configuration loaded successfully")
 
 	// Initialize database
-	log.Println("Initializing database connection...")
-	db, err := databse.NewDatabase(cfg.Database)
+	log.Println("Connecting to database...")
+	db, err := database.NewDatabase(cfg.Database)
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
-	log.Println("Database connection established successfully")
+	log.Println("Database connected successfully")
 
-	// Initialize job queue with retry mechanism
-	log.Printf("Initializing NATS connection to: %s", cfg.NATSURL)
+	// Initialize repositories
+	peopleRepo := repository.NewPeopleCountRepository(db)
+	sftpLogRepo := repository.NewSFTPLogRepository(db)
+	csvWriter := file.NewCSVWriter(cfg.LocalPath)
+
+	// Initialize NATS queue (for publishing jobs)
+	log.Println("Initializing NATS queue...")
 	var jobQueue queue.JobQueue
-	maxRetries := 5
+	maxRetries := 3
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		log.Printf("NATS connection attempt %d/%d", attempt, maxRetries)
-
-		jobQueue, err = queue.NewJobQueue(cfg.NATSURL)
+		jobQueue, err = queue.NewJobQueue(cfg.NATS.URL)
 		if err == nil {
-			log.Println("NATS connection established successfully")
+			log.Println("NATS queue connected successfully")
 			break
 		}
 
-		log.Printf("NATS connection attempt %d failed: %v", attempt, err)
+		log.Printf("Queue connection attempt %d failed: %v", attempt, err)
 		if attempt < maxRetries {
-			waitTime := time.Duration(attempt) * 2 * time.Second
-			log.Printf("Retrying NATS connection in %v...", waitTime)
-			time.Sleep(waitTime)
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
 		}
 	}
 
@@ -66,24 +67,23 @@ func main() {
 	}
 	defer jobQueue.Close()
 
-	// Initialize dependencies
-	log.Println("Initializing repositories and services...")
-	peopleRepo := repository.NewPeopleCountRepository(db)
-	sftpLogRepo := repository.NewSFTPLogRepository(db)
-	csvWriter := file.NewCSVWriter(cfg.LocalPath)
-
 	// Initialize services
 	exportService := service.NewExportService(peopleRepo, sftpLogRepo, csvWriter, cfg.LocalPath, jobQueue)
 	sftpService := service.NewSFTPService(sftpLogRepo, cfg.LocalPath)
 	lateDataService := service.NewLateDataService(peopleRepo, sftpLogRepo, csvWriter, cfg.LocalPath)
 
-	// Initialize job processor
-	log.Println("Starting job processor...")
-	jobProcessor := job.NewJobProcessor(jobQueue, exportService, sftpService, lateDataService)
-	if err := jobProcessor.Start(); err != nil {
-		log.Fatalf("Failed to start job processor: %v", err)
+	// Initialize NATS worker (for consuming jobs)
+	log.Println("Starting NATS worker...")
+	natsWorker, err := worker.NewNATSWorker(cfg.NATS.URL, exportService, sftpService, lateDataService)
+	if err != nil {
+		log.Fatalf("Failed to create NATS worker: %v", err)
 	}
-	log.Println("Job processor started successfully")
+
+	if err := natsWorker.Start(); err != nil {
+		log.Fatalf("Failed to start NATS worker: %v", err)
+	}
+	defer natsWorker.Stop()
+	log.Println("NATS worker started successfully")
 
 	// Initialize scheduler
 	log.Println("Starting scheduler...")
@@ -91,89 +91,61 @@ func main() {
 	if err := jobScheduler.Start(); err != nil {
 		log.Fatalf("Failed to start scheduler: %v", err)
 	}
+	defer jobScheduler.Stop()
 	log.Println("Scheduler started successfully")
 
-	// Initialize gRPC server
+	// Start gRPC server
+	log.Printf("Starting gRPC server on port %s...", cfg.GRPCPort)
 	exportGRPCServer := grpcHandler.NewSFTPGRPCServer(exportService)
-
-	// Start gRPC server in a goroutine
 	go func() {
 		if err := startGRPCServer(cfg, exportGRPCServer); err != nil {
 			log.Fatalf("Failed to start gRPC server: %v", err)
 		}
 	}()
 
-	log.Println("All services started successfully. Service is ready.")
+	log.Printf("JARVIST SFTP Service started successfully on port %s", cfg.GRPCPort)
+	log.Println("Service is ready to handle requests")
 
-	// Wait for interrupt signal to gracefully shutdown
-	gracefulShutdown(jobScheduler)
+	// Graceful shutdown
+	gracefulShutdown(jobScheduler, jobQueue, natsWorker)
 }
 
 func startGRPCServer(cfg *config.Config, server *grpcHandler.SFTPGRPCServer) error {
 	lis, err := net.Listen("tcp", ":"+cfg.GRPCPort)
 	if err != nil {
-		return fmt.Errorf("failed to listen on gRPC port %s: %w", cfg.GRPCPort, err)
+		return fmt.Errorf("failed to listen on port %s: %w", cfg.GRPCPort, err)
 	}
 
-	s := grpc.NewServer(
-		grpc.UnaryInterceptor(loggingInterceptor),
-	)
-
-	// Register export service
+	s := grpc.NewServer()
 	pb.RegisterExportServiceServer(s, server)
-
-	// Enable reflection for easier debugging
 	reflection.Register(s)
 
-	log.Printf("gRPC server starting on port %s", cfg.GRPCPort)
-	log.Printf("Export service ready to handle requests")
-
-	if err := s.Serve(lis); err != nil {
-		return fmt.Errorf("gRPC server failed to serve: %w", err)
-	}
-
-	return nil
+	log.Printf("gRPC server listening on port %s", cfg.GRPCPort)
+	return s.Serve(lis)
 }
 
-func gracefulShutdown(jobScheduler *scheduler.Scheduler) {
-	// Create a channel to receive OS signals
+func gracefulShutdown(jobScheduler *scheduler.Scheduler, jobQueue queue.JobQueue, natsWorker *worker.NATSWorker) {
 	sigChan := make(chan os.Signal, 1)
-
-	// Register the channel to receive specific signals
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Block until a signal is received
 	sig := <-sigChan
-	log.Printf("Received signal: %v. Shutting down gracefully...", sig)
+	log.Printf("Received signal %v, shutting down gracefully...", sig)
 
-	// Stop scheduler
+	// Stop components in reverse order
+	log.Println("Stopping scheduler...")
 	if jobScheduler != nil {
 		jobScheduler.Stop()
 	}
 
-	log.Println("Server stopped gracefully")
-}
-
-func loggingInterceptor(
-	ctx context.Context,
-	req interface{},
-	info *grpc.UnaryServerInfo,
-	handler grpc.UnaryHandler,
-) (interface{}, error) {
-	start := time.Now()
-
-	log.Printf("[GRPC] Starting %s", info.FullMethod)
-
-	resp, err := handler(ctx, req)
-
-	duration := time.Since(start)
-	status := "SUCCESS"
-	if err != nil {
-		status = "ERROR"
-		log.Printf("[GRPC] Error in %s: %v", info.FullMethod, err)
+	log.Println("Stopping NATS worker...")
+	if natsWorker != nil {
+		natsWorker.Stop()
 	}
 
-	log.Printf("[GRPC] Completed %s [%s] in %v", info.FullMethod, status, duration)
+	log.Println("Closing NATS queue...")
+	if jobQueue != nil {
+		jobQueue.Close()
+	}
 
-	return resp, err
+	log.Println("Server stopped gracefully")
 }

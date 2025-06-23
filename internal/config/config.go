@@ -18,7 +18,7 @@ type Config struct {
 	LocalPath string
 	LogPath   string
 	GRPCPort  string
-	NATSURL   string
+	NATS      NATSConfig
 }
 
 type Database struct {
@@ -29,6 +29,19 @@ type Database struct {
 	Password string
 	SSLMode  string
 	Debug    bool
+}
+
+type NATSConfig struct {
+	URL            string `json:"url"`
+	Username       string `json:"username"`
+	Password       string `json:"password"`
+	MaxReconnects  int    `json:"max_reconnects"`
+	ReconnectWait  int    `json:"reconnect_wait"`
+	ConnectTimeout int    `json:"connect_timeout"`
+	StreamName     string `json:"stream_name"`
+	MaxMessages    int64  `json:"max_messages"`
+	MaxBytes       int64  `json:"max_bytes"`
+	MaxAge         int    `json:"max_age_hours"`
 }
 
 type LateDataScheduleConfig struct {
@@ -53,10 +66,21 @@ func Load() *Config {
 			SSLMode:  getEnv("DB_SSL_MODE", "disable"),
 			Debug:    getBoolEnv("DB_DEBUG", false),
 		},
+		NATS: NATSConfig{
+			URL:            getEnv("NATS_URL", "nats://localhost:4222"),
+			Username:       getEnv("NATS_USERNAME", ""),
+			Password:       getEnv("NATS_PASSWORD", ""),
+			MaxReconnects:  getIntEnv("NATS_MAX_RECONNECTS", -1),
+			ReconnectWait:  getIntEnv("NATS_RECONNECT_WAIT", 5),
+			ConnectTimeout: getIntEnv("NATS_CONNECT_TIMEOUT", 30),
+			StreamName:     getEnv("NATS_STREAM_NAME", "JARVIST_SYNC"),
+			MaxMessages:    getInt64Env("NATS_MAX_MESSAGES", 1000000),
+			MaxBytes:       getInt64Env("NATS_MAX_BYTES", 2147483648), // 2GB
+			MaxAge:         getIntEnv("NATS_MAX_AGE_HOURS", 24),
+		},
 		LocalPath: getEnv("LOCAL_PATH", "./temp"),
 		LogPath:   getEnv("LOG_PATH", "./logs"),
-		GRPCPort:  getEnv("SFTP_SERVICE_PORT", "9082"),
-		NATSURL:   getEnv("NATS_URL", "nats://localhost:4222"),
+		GRPCPort:  getEnv("SFTP_SERVICE_PORT", "9081"),
 	}
 }
 
@@ -93,6 +117,20 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+func getInt64Env(key string, defaultValue int64) int64 {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
+	}
+
+	int64Value, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return defaultValue
+	}
+
+	return int64Value
 }
 
 func getBoolEnv(key string, defaultValue bool) bool {

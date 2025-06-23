@@ -1,9 +1,10 @@
 package utils
 
 import (
-	"jarvist/sftp/internal/domain/entity"
 	"os"
 	"path/filepath"
+
+	"jarvist/sftp-service/internal/domain/entity"
 )
 
 func DetermineFileType(fileName string) string {

@@ -3,11 +3,12 @@ package file
 import (
 	"encoding/csv"
 	"fmt"
-	"jarvist/sftp/internal/domain/entity"
 	"os"
 	"path/filepath"
 	"strconv"
 	"time"
+
+	"jarvist/sftp-service/internal/domain/entity"
 )
 
 type CSVWriter interface {

@@ -3,9 +3,10 @@ package repository
 import (
 	"context"
 	"fmt"
-	"jarvist/sftp/internal/config"
-	"jarvist/sftp/internal/domain/entity"
 	"time"
+
+	"jarvist/sftp-service/internal/config"
+	"jarvist/sftp-service/internal/domain/entity"
 
 	"gorm.io/gorm"
 )

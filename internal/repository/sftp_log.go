@@ -1,7 +1,7 @@
 package repository
 
 import (
-	"jarvist/sftp/internal/domain/entity"
+	"jarvist/sftp-service/internal/domain/entity"
 
 	"gorm.io/gorm"
 )

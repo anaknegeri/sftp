@@ -1,11 +1,12 @@
-package databse
+package database
 
 import (
 	"context"
 	"fmt"
-	"jarvist/sftp/internal/config"
 	"log"
 	"time"
+
+	"jarvist/sftp-service/internal/config"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"

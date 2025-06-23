@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"jarvist/sftp/pkg/utils"
+	"jarvist/sftp-service/pkg/utils"
 )
 
 // FileOperations provides common file operations used across services
