@@ -31,16 +31,45 @@ type ExportService interface {
 }
 
 type exportService struct {
-	peopleRepo      repository.PeopleCountRepository
-	sftpLogRepo     repository.SFTPLogRepository
-	csvWriter       file.CSVWriter
-	localPath       string
-	jobQueue        queue.JobQueue
-	processingMutex sync.RWMutex
-	processingFiles map[string]time.Time
+	peopleRepo  repository.PeopleCountRepository
+	sftpLogRepo repository.SFTPLogRepository
+	csvWriter   file.CSVWriter
+	localPath   string
+	jobQueue    queue.JobQueue
+
+	activeExports    sync.Map
+	globalExportLock sync.Map // For tenant-wide operations
+	fileGeneration   sync.Map // For preventing concurrent file generation
 }
 
-// NewExportService creates a new export service with queue integration
+type ExportKey struct {
+	TenantID   string
+	LocationID string
+	Date       string
+	Type       string // "daily" or "30min"
+	Window     string // for 30min reports: "0830", for daily: ""
+}
+
+func (ek ExportKey) String() string {
+	if ek.Window != "" {
+		return fmt.Sprintf("%s:%s:%s:%s:%s", ek.TenantID, ek.LocationID, ek.Date, ek.Type, ek.Window)
+	}
+	return fmt.Sprintf("%s:%s:%s:%s", ek.TenantID, ek.LocationID, ek.Date, ek.Type)
+}
+
+// Global export key for tenant-wide operations
+func (ek ExportKey) GlobalString() string {
+	return fmt.Sprintf("global:%s:%s:%s", ek.TenantID, ek.Date, ek.Type)
+}
+
+// File generation key to prevent concurrent file creation
+func (ek ExportKey) FileGenKey() string {
+	if ek.Window != "" {
+		return fmt.Sprintf("file:%s:%s:%s:%s:%s", ek.TenantID, ek.LocationID, ek.Date, ek.Type, ek.Window)
+	}
+	return fmt.Sprintf("file:%s:%s:%s:%s", ek.TenantID, ek.LocationID, ek.Date, ek.Type)
+}
+
 func NewExportService(
 	peopleRepo repository.PeopleCountRepository,
 	sftpLogRepo repository.SFTPLogRepository,
@@ -48,19 +77,147 @@ func NewExportService(
 	localPath string,
 	jobQueue queue.JobQueue,
 ) ExportService {
-	return &exportService{
-		peopleRepo:      peopleRepo,
-		sftpLogRepo:     sftpLogRepo,
-		csvWriter:       csvWriter,
-		localPath:       localPath,
-		jobQueue:        jobQueue,
-		processingFiles: make(map[string]time.Time),
+	service := &exportService{
+		peopleRepo:  peopleRepo,
+		sftpLogRepo: sftpLogRepo,
+		csvWriter:   csvWriter,
+		localPath:   localPath,
+		jobQueue:    jobQueue,
+	}
+
+	go service.cleanupExpiredExports()
+
+	return service
+}
+
+func (s *exportService) cleanupExpiredExports() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		cutoff := time.Now().Add(-5 * time.Minute)
+
+		// Cleanup active exports
+		s.activeExports.Range(func(key, value interface{}) bool {
+			if startTime, ok := value.(time.Time); ok {
+				if startTime.Before(cutoff) {
+					s.activeExports.Delete(key)
+					log.Printf("[EXPORT] Cleaned up expired export lock: %s", key)
+				}
+			}
+			return true
+		})
+
+		// Cleanup global locks
+		s.globalExportLock.Range(func(key, value interface{}) bool {
+			if startTime, ok := value.(time.Time); ok {
+				if startTime.Before(cutoff) {
+					s.globalExportLock.Delete(key)
+					log.Printf("[EXPORT] Cleaned up expired global lock: %s", key)
+				}
+			}
+			return true
+		})
+
+		// Cleanup file generation locks
+		s.fileGeneration.Range(func(key, value interface{}) bool {
+			if startTime, ok := value.(time.Time); ok {
+				if startTime.Before(cutoff) {
+					s.fileGeneration.Delete(key)
+					log.Printf("[EXPORT] Cleaned up expired file generation lock: %s", key)
+				}
+			}
+			return true
+		})
 	}
 }
 
-// ExportAllReport exports both daily and 30-minute reports for all locations
+func (s *exportService) acquireExportLock(key ExportKey) bool {
+	keyStr := key.String()
+
+	if _, exists := s.activeExports.Load(keyStr); exists {
+		log.Printf("[EXPORT] Export already in progress: %s", keyStr)
+		return false
+	}
+
+	_, loaded := s.activeExports.LoadOrStore(keyStr, time.Now())
+	if loaded {
+		log.Printf("[EXPORT] Failed to acquire export lock: %s", keyStr)
+		return false
+	}
+
+	log.Printf("[EXPORT] Acquired export lock: %s", keyStr)
+	return true
+}
+
+func (s *exportService) releaseExportLock(key ExportKey) {
+	keyStr := key.String()
+	s.activeExports.Delete(keyStr)
+	log.Printf("[EXPORT] Released export lock: %s", keyStr)
+}
+
+func (s *exportService) acquireGlobalExportLock(key ExportKey) bool {
+	globalKey := key.GlobalString()
+
+	if _, exists := s.globalExportLock.Load(globalKey); exists {
+		log.Printf("[EXPORT] Global export already in progress: %s", globalKey)
+		return false
+	}
+
+	_, loaded := s.globalExportLock.LoadOrStore(globalKey, time.Now())
+	if loaded {
+		log.Printf("[EXPORT] Failed to acquire global export lock: %s", globalKey)
+		return false
+	}
+
+	log.Printf("[EXPORT] Acquired global export lock: %s", globalKey)
+	return true
+}
+
+func (s *exportService) releaseGlobalExportLock(key ExportKey) {
+	globalKey := key.GlobalString()
+	s.globalExportLock.Delete(globalKey)
+	log.Printf("[EXPORT] Released global export lock: %s", globalKey)
+}
+
+func (s *exportService) acquireFileGenerationLock(key ExportKey) bool {
+	fileKey := key.FileGenKey()
+
+	if _, exists := s.fileGeneration.Load(fileKey); exists {
+		log.Printf("[EXPORT] File generation already in progress: %s", fileKey)
+		return false
+	}
+
+	_, loaded := s.fileGeneration.LoadOrStore(fileKey, time.Now())
+	if loaded {
+		log.Printf("[EXPORT] Failed to acquire file generation lock: %s", fileKey)
+		return false
+	}
+
+	log.Printf("[EXPORT] Acquired file generation lock: %s", fileKey)
+	return true
+}
+
+func (s *exportService) releaseFileGenerationLock(key ExportKey) {
+	fileKey := key.FileGenKey()
+	s.fileGeneration.Delete(fileKey)
+	log.Printf("[EXPORT] Released file generation lock: %s", fileKey)
+}
+
 func (s *exportService) ExportAllReport(tenantID string, date time.Time) error {
 	log.Printf("[EXPORT] Starting complete export for tenant %s, date %s", tenantID, date.Format("2006-01-02"))
+
+	// Acquire global lock for tenant-wide operations
+	globalKey := ExportKey{
+		TenantID: tenantID,
+		Date:     date.Format("20060102"),
+		Type:     "all",
+	}
+
+	if !s.acquireGlobalExportLock(globalKey) {
+		return fmt.Errorf("another export operation is already running for tenant %s on date %s", tenantID, date.Format("2006-01-02"))
+	}
+	defer s.releaseGlobalExportLock(globalKey)
 
 	locations, err := s.getLocations(tenantID)
 	if err != nil {
@@ -81,9 +238,20 @@ func (s *exportService) ExportAllReport(tenantID string, date time.Time) error {
 	return nil
 }
 
-// ExportDaily exports only daily reports for all locations
 func (s *exportService) ExportDaily(tenantID string, date time.Time) error {
 	log.Printf("[DAILY] Starting daily export for tenant %s, date %s", tenantID, date.Format("2006-01-02"))
+
+	// Acquire global lock for tenant-wide daily operations
+	globalKey := ExportKey{
+		TenantID: tenantID,
+		Date:     date.Format("20060102"),
+		Type:     "daily",
+	}
+
+	if !s.acquireGlobalExportLock(globalKey) {
+		return fmt.Errorf("another daily export operation is already running for tenant %s on date %s", tenantID, date.Format("2006-01-02"))
+	}
+	defer s.releaseGlobalExportLock(globalKey)
 
 	locations, err := s.getLocations(tenantID)
 	if err != nil {
@@ -104,10 +272,21 @@ func (s *exportService) ExportDaily(tenantID string, date time.Time) error {
 	return nil
 }
 
-// Export30Min exports cumulative 30-minute reports up to the trigger time
 func (s *exportService) Export30Min(tenantID string, triggerTime time.Time) error {
 	log.Printf("[30MIN] Starting 30-minute cumulative export for tenant %s, triggered at %s",
 		tenantID, triggerTime.Format("2006-01-02 15:04"))
+
+	// Acquire global lock for tenant-wide 30min operations
+	globalKey := ExportKey{
+		TenantID: tenantID,
+		Date:     triggerTime.Format("20060102"),
+		Type:     "30min",
+	}
+
+	if !s.acquireGlobalExportLock(globalKey) {
+		return fmt.Errorf("another 30min export operation is already running for tenant %s", tenantID)
+	}
+	defer s.releaseGlobalExportLock(globalKey)
 
 	locations, err := s.getLocations(tenantID)
 	if err != nil {
@@ -128,10 +307,20 @@ func (s *exportService) Export30Min(tenantID string, triggerTime time.Time) erro
 	return nil
 }
 
-// ExportByLocationID exports daily report for a specific location
 func (s *exportService) ExportByLocationID(tenantID, locationID string, date time.Time) error {
 	log.Printf("[DAILY] Starting daily export for tenant %s, location %s, date %s",
 		tenantID, locationID, date.Format("2006-01-02"))
+
+	// Check if tenant-wide export is running
+	globalKey := ExportKey{
+		TenantID: tenantID,
+		Date:     date.Format("20060102"),
+		Type:     "daily",
+	}
+
+	if _, exists := s.globalExportLock.Load(globalKey.GlobalString()); exists {
+		return fmt.Errorf("tenant-wide daily export is already running, please wait")
+	}
 
 	location, err := s.getLocationByID(tenantID, locationID)
 	if err != nil {
@@ -146,10 +335,20 @@ func (s *exportService) ExportByLocationID(tenantID, locationID string, date tim
 	return nil
 }
 
-// Export30MinByLocationID exports cumulative 30-minute report for a specific location
 func (s *exportService) Export30MinByLocationID(tenantID, locationID string, triggerTime time.Time) error {
 	log.Printf("[30MIN] Starting 30-minute cumulative export for tenant %s, location %s, triggered at %s",
 		tenantID, locationID, triggerTime.Format("2006-01-02 15:04"))
+
+	// Check if tenant-wide export is running
+	globalKey := ExportKey{
+		TenantID: tenantID,
+		Date:     triggerTime.Format("20060102"),
+		Type:     "30min",
+	}
+
+	if _, exists := s.globalExportLock.Load(globalKey.GlobalString()); exists {
+		return fmt.Errorf("tenant-wide 30min export is already running, please wait")
+	}
 
 	location, err := s.getLocationByID(tenantID, locationID)
 	if err != nil {
@@ -164,10 +363,33 @@ func (s *exportService) Export30MinByLocationID(tenantID, locationID string, tri
 	return nil
 }
 
-// ExportAllReportByLocationID exports both daily and all 30-minute reports for a specific location
 func (s *exportService) ExportAllReportByLocationID(tenantID, locationID string, date time.Time) error {
 	log.Printf("[COMPLETE] Starting complete export for tenant %s, location %s, date %s",
 		tenantID, locationID, date.Format("2006-01-02"))
+
+	// Check if tenant-wide export is running
+	globalKey := ExportKey{
+		TenantID: tenantID,
+		Date:     date.Format("20060102"),
+		Type:     "all",
+	}
+
+	if _, exists := s.globalExportLock.Load(globalKey.GlobalString()); exists {
+		return fmt.Errorf("tenant-wide complete export is already running, please wait")
+	}
+
+	// Acquire lock for this specific location complete export
+	locationKey := ExportKey{
+		TenantID:   tenantID,
+		LocationID: locationID,
+		Date:       date.Format("20060102"),
+		Type:       "complete",
+	}
+
+	if !s.acquireExportLock(locationKey) {
+		return fmt.Errorf("complete export already in progress for location %s", locationID)
+	}
+	defer s.releaseExportLock(locationKey)
 
 	location, err := s.getLocationByID(tenantID, locationID)
 	if err != nil {
@@ -182,7 +404,6 @@ func (s *exportService) ExportAllReportByLocationID(tenantID, locationID string,
 	return nil
 }
 
-// getLocations retrieves locations for a tenant with error handling
 func (s *exportService) getLocations(tenantID string) ([]entity.Location, error) {
 	locations, err := s.peopleRepo.GetLocations(tenantID)
 	if err != nil {
@@ -199,87 +420,95 @@ func (s *exportService) getLocations(tenantID string) ([]entity.Location, error)
 	return locations, nil
 }
 
-// processDailyReport handles daily report processing for a single location
-// After creating CSV file, it saves log to database and queues upload job
 func (s *exportService) processDailyReport(tenantID string, location entity.Location, date time.Time) error {
-	jakartaTime := date.In(config.GetJakartaTimezone())
-	locationProcessKey := fmt.Sprintf("%s_%s_%s_daily", tenantID, location.ID, jakartaTime.Format("20060102"))
-
-	log.Printf("[DAILY] Processing location %s for date %s (Jakarta: %s)",
-		location.LocationCode, date.Format("2006-01-02"), jakartaTime.Format("2006-01-02 15:04 MST"))
-
-	// Check if this location+date is currently being processed
-	if s.isFileCurrentlyProcessing(locationProcessKey) {
-		log.Printf("[DAILY] Location %s for date %s is currently being processed, skipping",
-			location.LocationCode, date.Format("2006-01-02"))
-		return nil
+	exportKey := ExportKey{
+		TenantID:   tenantID,
+		LocationID: location.ID,
+		Date:       date.Format("20060102"),
+		Type:       "daily",
 	}
 
-	if !s.markFileAsProcessing(locationProcessKey) {
-		log.Printf("[DAILY] Location %s for date %s started processing by another worker, skipping",
-			location.LocationCode, date.Format("2006-01-02"))
+	if !s.acquireExportLock(exportKey) {
+		log.Printf("[DAILY] Skipping duplicate export for location %s on %s", location.LocationCode, date.Format("2006-01-02"))
 		return nil
 	}
-	defer s.unmarkFileAsProcessing(locationProcessKey)
+	defer s.releaseExportLock(exportKey)
 
-	// Get reports from database
+	// Acquire file generation lock
+	if !s.acquireFileGenerationLock(exportKey) {
+		log.Printf("[DAILY] File generation already in progress for location %s", location.LocationCode)
+		return nil
+	}
+	defer s.releaseFileGenerationLock(exportKey)
+
+	log.Printf("[DAILY] Processing location %s for date %s", location.LocationCode, date.Format("2006-01-02"))
+
 	reports, err := s.peopleRepo.GetReport(tenantID, location.ID, date)
 	if err != nil {
 		return fmt.Errorf("failed to get reports for location %s: %w", location.LocationCode, err)
 	}
 
 	if len(reports) == 0 {
-		log.Printf("[DAILY] No data found for location %s on %s", location.LocationCode, jakartaTime.Format("2006-01-02"))
+		log.Printf("[DAILY] No data found for location %s on %s",
+			location.LocationCode, date.Format("2006-01-02"))
 		return nil
 	}
 
-	// Write CSV file
 	filePath, err := s.csvWriter.WriteDailyReport(tenantID, location.LocationCode, reports, date)
 	if err != nil {
 		return fmt.Errorf("failed to write daily CSV for location %s: %w", location.LocationCode, err)
 	}
 
-	recordCount := s.countFileRecords(filePath)
-	log.Printf("[DAILY] Successfully created file: %s (%d records)", filePath, recordCount)
+	// Validate file was created properly
+	if !s.validateGeneratedFile(filePath) {
+		return fmt.Errorf("generated file is invalid: %s", filePath)
+	}
 
-	// Save file log to database and queue upload job
-	if err := s.saveFileAndQueueUpload(tenantID, location.ID, filePath); err != nil {
+	recordCount := s.countFileRecords(filePath)
+	log.Printf("[DAILY] Created file: %s (%d records)", filePath, recordCount)
+
+	if err := s.createLogAndQueueUpload(tenantID, location.ID, filePath); err != nil {
 		log.Printf("[DAILY] Failed to queue upload for %s: %v", filePath, err)
-		// Don't return error, file was created successfully
+		return err
 	}
 
 	log.Printf("[DAILY] Daily export completed for location %s", location.LocationCode)
 	return nil
 }
 
-// process30MinReport handles 30-minute cumulative report processing for a single location
-// After creating CSV file, it saves log to database and queues upload job
 func (s *exportService) process30MinReport(tenantID string, location entity.Location, triggerTime time.Time) error {
 	jakartaTriggerTime := triggerTime.In(config.GetJakartaTimezone())
-	currentWindow := jakartaTriggerTime.Truncate(30 * time.Minute)
+	currentWindow := jakartaTriggerTime.Truncate(30 * time.Minute).Add(30 * time.Minute)
 
-	locationProcessKey := fmt.Sprintf("%s_%s_%s_30min", tenantID, location.ID, currentWindow.Format("20060102_1504"))
-
-	log.Printf("[30MIN] Processing location %s for trigger time %s (Jakarta: %s)",
-		location.LocationCode, triggerTime.Format("2006-01-02 15:04"), jakartaTriggerTime.Format("2006-01-02 15:04 MST"))
-
-	// Check if this location+window is currently being processed
-	if s.isFileCurrentlyProcessing(locationProcessKey) {
-		log.Printf("[30MIN] Location %s for window %s is currently being processed, skipping", location.LocationCode, currentWindow.Format("15:04"))
-		return nil
+	exportKey := ExportKey{
+		TenantID:   tenantID,
+		LocationID: location.ID,
+		Date:       jakartaTriggerTime.Format("20060102"),
+		Type:       "30min",
+		Window:     currentWindow.Format("1504"),
 	}
 
-	if !s.markFileAsProcessing(locationProcessKey) {
-		log.Printf("[30MIN] Location %s for window %s started processing by another worker, skipping",
+	if !s.acquireExportLock(exportKey) {
+		log.Printf("[30MIN] Skipping duplicate export for location %s window %s",
 			location.LocationCode, currentWindow.Format("15:04"))
 		return nil
 	}
-	defer s.unmarkFileAsProcessing(locationProcessKey)
+	defer s.releaseExportLock(exportKey)
 
-	// Ensure today is in Jakarta timezone
-	today := time.Date(jakartaTriggerTime.Year(), jakartaTriggerTime.Month(), jakartaTriggerTime.Day(), 0, 0, 0, 0, config.GetJakartaTimezone())
+	// Acquire file generation lock
+	if !s.acquireFileGenerationLock(exportKey) {
+		log.Printf("[30MIN] File generation already in progress for location %s window %s",
+			location.LocationCode, currentWindow.Format("15:04"))
+		return nil
+	}
+	defer s.releaseFileGenerationLock(exportKey)
 
-	// Get reports within time range
+	log.Printf("[30MIN] Processing location %s for window %s",
+		location.LocationCode, currentWindow.Format("15:04"))
+
+	today := time.Date(jakartaTriggerTime.Year(), jakartaTriggerTime.Month(), jakartaTriggerTime.Day(),
+		0, 0, 0, 0, config.GetJakartaTimezone())
+
 	allReports, err := s.peopleRepo.GetReportWithTimeRange(tenantID, location.ID, today, triggerTime)
 	if err != nil {
 		return fmt.Errorf("failed to get reports for location %s: %w", location.LocationCode, err)
@@ -291,19 +520,22 @@ func (s *exportService) process30MinReport(tenantID string, location entity.Loca
 		return nil
 	}
 
-	// Write CSV file
 	filePath, err := s.csvWriter.Write30MinReport(tenantID, location.LocationCode, allReports, currentWindow)
 	if err != nil {
 		return fmt.Errorf("failed to write 30-minute cumulative report for location %s: %w", location.LocationCode, err)
 	}
 
-	recordCount := s.countFileRecords(filePath)
-	log.Printf("[30MIN] Successfully created file: %s (%d records)", filePath, recordCount)
+	// Validate file was created properly
+	if !s.validateGeneratedFile(filePath) {
+		return fmt.Errorf("generated file is invalid: %s", filePath)
+	}
 
-	// Save file log to database and queue upload job
-	if err := s.saveFileAndQueueUpload(tenantID, location.ID, filePath); err != nil {
+	recordCount := s.countFileRecords(filePath)
+	log.Printf("[30MIN] Created file: %s (%d records)", filePath, recordCount)
+
+	if err := s.createLogAndQueueUpload(tenantID, location.ID, filePath); err != nil {
 		log.Printf("[30MIN] Failed to queue upload for %s: %v", filePath, err)
-		// Don't return error, file was created successfully
+		return err
 	}
 
 	log.Printf("[30MIN] 30-minute export completed for location %s at window %s",
@@ -311,40 +543,30 @@ func (s *exportService) process30MinReport(tenantID string, location entity.Loca
 	return nil
 }
 
-// processCompleteReport handles both daily and all 30-minute window reports for a single location
 func (s *exportService) processCompleteReport(tenantID string, location entity.Location, date time.Time) error {
 	log.Printf("[COMPLETE] Processing complete report for location %s on date %s",
 		location.LocationCode, date.Format("2006-01-02"))
 
+	// Process daily report first
+	if err := s.processDailyReport(tenantID, location, date); err != nil {
+		return fmt.Errorf("failed to process daily report: %w", err)
+	}
+
+	// Get reports for 30min processing
 	reports, err := s.peopleRepo.GetReport(tenantID, location.ID, date)
 	if err != nil {
 		return fmt.Errorf("failed to get reports for location %s: %w", location.LocationCode, err)
 	}
 
 	if len(reports) == 0 {
-		log.Printf("[COMPLETE] No data found for location %s on %s", location.LocationCode, date.Format("2006-01-02"))
+		log.Printf("[COMPLETE] No data found for location %s on %s",
+			location.LocationCode, date.Format("2006-01-02"))
 		return nil
 	}
 
-	// Write daily report and queue upload
-	dailyFilePath, err := s.csvWriter.WriteDailyReport(tenantID, location.LocationCode, reports, date)
-	if err != nil {
-		return fmt.Errorf("failed to write daily CSV for location %s: %w", location.LocationCode, err)
-	}
-
-	dailyRecordCount := s.countFileRecords(dailyFilePath)
-	log.Printf("[COMPLETE] Daily report created: %s (%d records)", dailyFilePath, dailyRecordCount)
-
-	// Save daily file log and queue upload
-	if err := s.saveFileAndQueueUpload(tenantID, location.ID, dailyFilePath); err != nil {
-		log.Printf("[COMPLETE] Failed to queue upload for daily file %s: %v", dailyFilePath, err)
-	}
-
-	// Process 30-minute windows
 	return s.process30MinWindows(tenantID, location, reports)
 }
 
-// process30MinWindows processes all 30-minute windows for the given reports
 func (s *exportService) process30MinWindows(tenantID string, location entity.Location, reports []entity.DailyReport) error {
 	windowsMap := s.groupReportsByWindows(reports)
 	sortedWindows := s.sortWindows(windowsMap)
@@ -358,31 +580,54 @@ func (s *exportService) process30MinWindows(tenantID string, location entity.Loc
 
 	successCount := 0
 	for i, windowTime := range sortedWindows {
-		cumulativeReports := s.filterCumulativeDataUpToWindow(reports, windowTime)
-		if len(cumulativeReports) == 0 {
-			log.Printf("[30MIN] No cumulative data for window %s at location %s, skipping",
+		// Create export key for this window
+		exportKey := ExportKey{
+			TenantID:   tenantID,
+			LocationID: location.ID,
+			Date:       windowTime.Format("20060102"),
+			Type:       "30min",
+			Window:     windowTime.Format("1504"),
+		}
+
+		// Acquire file generation lock for this window
+		if !s.acquireFileGenerationLock(exportKey) {
+			log.Printf("[30MIN] File generation already in progress for window %s at location %s",
 				windowTime.Format("15:04"), location.LocationCode)
 			continue
 		}
 
-		// Write 30-minute report
+		cumulativeReports := s.filterCumulativeDataUpToWindow(reports, windowTime)
+		if len(cumulativeReports) == 0 {
+			log.Printf("[30MIN] No cumulative data for window %s at location %s, skipping",
+				windowTime.Format("15:04"), location.LocationCode)
+			s.releaseFileGenerationLock(exportKey)
+			continue
+		}
+
 		filePath, err := s.csvWriter.Write30MinReport(tenantID, location.LocationCode, cumulativeReports, windowTime)
 		if err != nil {
 			log.Printf("[30MIN] Failed to write 30-minute report for window %s at location %s: %v",
 				windowTime.Format("15:04"), location.LocationCode, err)
+			s.releaseFileGenerationLock(exportKey)
+			continue
+		}
+
+		// Validate file
+		if !s.validateGeneratedFile(filePath) {
+			log.Printf("[30MIN] Generated file is invalid for window %s: %s", windowTime.Format("15:04"), filePath)
+			s.releaseFileGenerationLock(exportKey)
 			continue
 		}
 
 		recordCount := s.countFileRecords(filePath)
 
-		// Save file log and queue upload
-		if err := s.saveFileAndQueueUpload(tenantID, location.ID, filePath); err != nil {
+		if err := s.createLogAndQueueUpload(tenantID, location.ID, filePath); err != nil {
 			log.Printf("[30MIN] Failed to queue upload for window file %s: %v", filePath, err)
 		}
 
+		s.releaseFileGenerationLock(exportKey)
 		successCount++
 
-		// Log progress every 5 windows or at the last window
 		if i%5 == 0 || i == len(sortedWindows)-1 {
 			log.Printf("[30MIN] Progress for location %s: %d/%d windows completed (latest: %s with %d records)",
 				location.LocationCode, i+1, len(sortedWindows), windowTime.Format("15:04"), recordCount)
@@ -394,7 +639,38 @@ func (s *exportService) process30MinWindows(tenantID string, location entity.Loc
 	return nil
 }
 
-// getLocationByID retrieves a specific location by ID directly from database
+// Validate that the generated file is valid
+func (s *exportService) validateGeneratedFile(filePath string) bool {
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		log.Printf("[ERROR] Failed to stat file %s: %v", filePath, err)
+		return false
+	}
+
+	if fileInfo.Size() == 0 {
+		log.Printf("[ERROR] Generated file is empty: %s", filePath)
+		return false
+	}
+
+	// Check if file is readable
+	file, err := os.Open(filePath)
+	if err != nil {
+		log.Printf("[ERROR] Failed to open file %s: %v", filePath, err)
+		return false
+	}
+	defer file.Close()
+
+	// Read first few bytes to ensure file is not corrupted
+	buffer := make([]byte, 100)
+	_, err = file.Read(buffer)
+	if err != nil {
+		log.Printf("[ERROR] Failed to read file %s: %v", filePath, err)
+		return false
+	}
+
+	return true
+}
+
 func (s *exportService) getLocationByID(tenantID, locationID string) (entity.Location, error) {
 	location, err := s.peopleRepo.GetLocationByID(tenantID, locationID)
 	if err != nil {
@@ -406,176 +682,63 @@ func (s *exportService) getLocationByID(tenantID, locationID string) (entity.Loc
 	return location, nil
 }
 
-// isFileCurrentlyProcessing checks if file is being processed by another goroutine
-func (s *exportService) isFileCurrentlyProcessing(fileName string) bool {
-	s.processingMutex.RLock()
-	defer s.processingMutex.RUnlock()
-
-	if lastProcessTime, exists := s.processingFiles[fileName]; exists {
-		// If processing started less than 5 minutes ago, consider it active
-		if time.Since(lastProcessTime) < 5*time.Minute {
-			return true
-		}
-		// Clean up old entries
-		delete(s.processingFiles, fileName)
-	}
-	return false
-}
-
-// markFileAsProcessing marks file as currently being processed
-func (s *exportService) markFileAsProcessing(fileName string) bool {
-	s.processingMutex.Lock()
-	defer s.processingMutex.Unlock()
-
-	// Double-check after acquiring write lock
-	if lastProcessTime, exists := s.processingFiles[fileName]; exists {
-		if time.Since(lastProcessTime) < 5*time.Minute {
-			return false // Already being processed
-		}
-	}
-
-	s.processingFiles[fileName] = time.Now()
-	return true
-}
-
-// unmarkFileAsProcessing removes file from processing tracker
-func (s *exportService) unmarkFileAsProcessing(fileName string) {
-	s.processingMutex.Lock()
-	defer s.processingMutex.Unlock()
-	delete(s.processingFiles, fileName)
-}
-
-// saveFileAndQueueUpload saves file information to database with PENDING status
-func (s *exportService) saveFileAndQueueUpload(tenantID, locationID, filePath string) error {
+func (s *exportService) createLogAndQueueUpload(tenantID, locationID, filePath string) error {
 	fileName := filepath.Base(filePath)
 	fileType := utils.DetermineFileType(fileName)
 
-	// 1. Check if file is currently being processed by another goroutine
-	if s.isFileCurrentlyProcessing(fileName) {
-		log.Printf("[EXPORT] File %s is currently being processed by another worker, skipping", fileName)
-		return nil
-	}
+	log.Printf("[EXPORT] Creating log and queuing upload for: %s", fileName)
 
-	// 2. Mark file as being processed
-	if !s.markFileAsProcessing(fileName) {
-		log.Printf("[EXPORT] File %s started processing by another worker while checking, skipping", fileName)
-		return nil
-	}
-	defer s.unmarkFileAsProcessing(fileName)
-
-	// 3. Check database for recent uploads with more granular timing
-	existingLog, err := s.sftpLogRepo.GetByFileName(fileName)
-	if err != nil {
-		log.Printf("[EXPORT] Failed to check existing log for %s: %v", fileName, err)
-	}
-
-	// 4. Enhanced duplicate prevention logic
-	if existingLog != nil {
-		timeSinceCreated := time.Since(existingLog.CreatedAt)
-
-		switch existingLog.Status {
-		case "SUCCESS":
-			// Skip if successfully uploaded recently (30 seconds)
-			if timeSinceCreated < 30*time.Second {
-				log.Printf("[EXPORT] File %s was successfully uploaded %.1f seconds ago, skipping duplicate",
-					fileName, timeSinceCreated.Seconds())
-				return nil
-			}
-			// Allow repush for older successful uploads
-			log.Printf("[EXPORT] File %s was uploaded %.1f minutes ago, proceeding with repush",
-				fileName, timeSinceCreated.Minutes())
-
-		case "PENDING":
-			// Skip if pending upload is very recent (10 seconds)
-			if timeSinceCreated < 10*time.Second {
-				log.Printf("[EXPORT] File %s has PENDING upload from %.1f seconds ago, skipping duplicate", fileName, timeSinceCreated.Seconds())
-				return nil
-			}
-			// Continue processing if pending for too long (might be stuck)
-			log.Printf("[EXPORT] File %s has stale PENDING upload from %.1f minutes ago, retrying",
-				fileName, timeSinceCreated.Minutes())
-
-		case "FAILED":
-			// Allow retry for failed uploads, but not too frequently
-			if timeSinceCreated < 30*time.Second {
-				log.Printf("[EXPORT] File %s failed upload %.1f seconds ago, too soon to retry", fileName, timeSinceCreated.Seconds())
-				return nil
-			}
-			log.Printf("[EXPORT] File %s failed upload %.1f minutes ago, proceeding with retry", fileName, timeSinceCreated.Minutes())
-		}
-	}
-
-	// 5. Get tenant configuration
-	tenantConfig, exists := config.GetTenantByID(tenantID)
-	if !exists {
-		return fmt.Errorf("tenant %s not found or disabled", tenantID)
-	}
-
-	// 6. Get file information
 	fileInfo, err := os.Stat(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to get file info: %w", err)
 	}
 
+	if fileInfo.Size() == 0 {
+		return fmt.Errorf("file is empty: %s", filePath)
+	}
+
+	tenantConfig, exists := config.GetTenantByID(tenantID)
+	if !exists {
+		return fmt.Errorf("tenant %s not found or disabled", tenantID)
+	}
+
 	recordCount := utils.CountFileRecords(filePath)
 	remotePath := strings.ReplaceAll(filepath.Join(tenantConfig.SFTP.BasePath, fileName), "\\", "/")
 
-	var transferLog *entity.SFTPTransferLog
-
-	// 7. Handle existing PENDING logs smartly
-	if existingLog != nil && existingLog.Status == "PENDING" && time.Since(existingLog.CreatedAt) > 10*time.Second {
-		// Update existing stale PENDING log
-		transferLog = existingLog
-		transferLog.FilePath = filePath
-		transferLog.RemotePath = remotePath
-		transferLog.FileSize = fileInfo.Size()
-		transferLog.RecordCount = &recordCount
-		transferLog.TransferStartTime = time.Now()
-
-		if err := s.sftpLogRepo.Update(transferLog); err != nil {
-			log.Printf("[EXPORT] Failed to update existing PENDING log for %s: %v", fileName, err)
-			return fmt.Errorf("failed to update transfer log: %w", err)
-		}
-
-		log.Printf("[EXPORT] Updated stale PENDING log for %s (was created %.1f minutes ago)",
-			fileName, time.Since(existingLog.CreatedAt).Minutes())
-	} else {
-		// 8. Create new log entry with deduplication key
-		transferLog = &entity.SFTPTransferLog{
-			ID:                uuid.New().String(),
-			TenantID:          tenantID,
-			LocationID:        locationID,
-			FileName:          fileName,
-			FilePath:          filePath,
-			RemotePath:        remotePath,
-			Status:            "PENDING",
-			FileSize:          fileInfo.Size(),
-			TransferStartTime: time.Now(),
-			RecordCount:       &recordCount,
-			FileType:          fileType,
-			CreatedAt:         time.Now(),
-		}
-
-		if err := s.sftpLogRepo.Create(transferLog); err != nil {
-			// Handle potential duplicate key error gracefully
-			if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique constraint") {
-				log.Printf("[EXPORT] Duplicate log entry detected for %s, another process created it", fileName)
-				return nil
-			}
-			log.Printf("[EXPORT] Failed to create transfer log for %s: %v", fileName, err)
-			return fmt.Errorf("failed to create transfer log: %w", err)
-		}
-
-		logType := "initial"
-		if existingLog != nil {
-			logType = "repush"
-		}
-		log.Printf("[EXPORT] File log created (%s): %s (PENDING) with remote path: %s",
-			logType, fileName, remotePath)
+	// Enhanced duplicate check - check both by filename and by content characteristics
+	if s.isDuplicateUpload(tenantID, locationID, fileName, fileInfo.Size(), recordCount) {
+		log.Printf("[EXPORT] Skipping duplicate upload: %s (size: %d, records: %d)",
+			fileName, fileInfo.Size(), recordCount)
+		return nil
 	}
 
-	// 9. Create upload job with deduplication ID
+	// Create log entry
+	transferLog := &entity.SFTPTransferLog{
+		ID:                uuid.New().String(),
+		TenantID:          tenantID,
+		LocationID:        locationID,
+		FileName:          fileName,
+		FilePath:          filePath,
+		RemotePath:        remotePath,
+		Status:            "PENDING",
+		FileSize:          fileInfo.Size(),
+		TransferStartTime: time.Now(),
+		RecordCount:       &recordCount,
+		FileType:          fileType,
+		CreatedAt:         time.Now(),
+	}
+
+	if err := s.sftpLogRepo.Create(transferLog); err != nil {
+		log.Printf("[EXPORT] Failed to create transfer log for %s: %v", fileName, err)
+		return fmt.Errorf("failed to create transfer log: %w", err)
+	}
+
+	log.Printf("[EXPORT] Created log entry: %s (ID: %s, size: %d, records: %d)",
+		fileName, transferLog.ID, fileInfo.Size(), recordCount)
+
+	// Create upload job with log ID
 	uploadJob := types.UploadSFTPJob{
+		LogID:      transferLog.ID,
 		TenantID:   tenantID,
 		FilePath:   filePath,
 		FileName:   fileName,
@@ -585,26 +748,65 @@ func (s *exportService) saveFileAndQueueUpload(tenantID, locationID, filePath st
 		CreatedAt:  time.Now(),
 	}
 
-	// 10. Publish upload job to queue with retry
-	maxRetries := 3
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		if err := s.jobQueue.PublishJob(types.SubjectUploadSFTP, uploadJob); err != nil {
-			log.Printf("[EXPORT] Failed to publish upload job for %s (attempt %d/%d): %v",
-				fileName, attempt, maxRetries, err)
-			if attempt == maxRetries {
-				return fmt.Errorf("failed to publish upload job after %d attempts: %w", maxRetries, err)
-			}
-			time.Sleep(time.Duration(attempt) * time.Second)
-			continue
-		}
-		break
+	if err := s.jobQueue.PublishJob(types.SubjectUploadSFTP, uploadJob); err != nil {
+		errorMsg := fmt.Sprintf("Failed to queue upload job: %v", err)
+		s.sftpLogRepo.UpdateStatus(transferLog.ID, "FAILED", &errorMsg)
+
+		log.Printf("[EXPORT] Failed to queue upload job for %s: %v", fileName, err)
+		return fmt.Errorf("failed to publish upload job: %w", err)
 	}
 
 	log.Printf("[EXPORT] Upload job queued: %s (log ID: %s)", fileName, transferLog.ID)
 	return nil
 }
 
-// groupReportsByWindows groups reports by their respective 30-minute windows
+func (s *exportService) isDuplicateUpload(tenantID, locationID, fileName string, fileSize int64, recordCount int) bool {
+	// Check recent uploads for this specific file
+	recentLogs, err := s.sftpLogRepo.GetRecentByFileName(fileName, 10*time.Minute)
+	if err != nil {
+		log.Printf("[EXPORT] Failed to check recent uploads: %v", err)
+		return false
+	}
+
+	for _, recentLog := range recentLogs {
+		if recentLog.TenantID == tenantID &&
+			recentLog.LocationID == locationID {
+
+			timeDiff := time.Since(recentLog.CreatedAt)
+
+			// If there's a recent upload with same characteristics
+			if recentLog.FileSize == fileSize &&
+				recentLog.RecordCount != nil &&
+				*recentLog.RecordCount == recordCount &&
+				timeDiff < 5*time.Minute {
+
+				log.Printf("[EXPORT] Found identical recent upload: %s (%.1f seconds ago, status: %s, size: %d, records: %d)",
+					fileName, timeDiff.Seconds(), recentLog.Status, recentLog.FileSize, *recentLog.RecordCount)
+				return true
+			}
+
+			// If there's a very recent upload (regardless of size) - might be concurrent
+			if timeDiff < 30*time.Second {
+				log.Printf("[EXPORT] Found very recent upload: %s (%.1f seconds ago, status: %s) - treating as duplicate",
+					fileName, timeDiff.Seconds(), recentLog.Status)
+				return true
+			}
+
+			// If there's a completed upload with non-zero size within time window
+			if recentLog.Status == "COMPLETED" &&
+				recentLog.FileSize > 0 &&
+				timeDiff < 2*time.Minute {
+
+				log.Printf("[EXPORT] Found recent completed upload: %s (%.1f seconds ago, size: %d)",
+					fileName, timeDiff.Seconds(), recentLog.FileSize)
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 func (s *exportService) groupReportsByWindows(reports []entity.DailyReport) map[time.Time][]entity.DailyReport {
 	windows := make(map[time.Time][]entity.DailyReport)
 
@@ -615,7 +817,6 @@ func (s *exportService) groupReportsByWindows(reports []entity.DailyReport) map[
 			continue
 		}
 
-		// Create 30-minute window boundary (next 30-minute mark)
 		windowStart := reportTime.Truncate(30 * time.Minute).Add(30 * time.Minute)
 		windows[windowStart] = append(windows[windowStart], report)
 	}
@@ -623,14 +824,12 @@ func (s *exportService) groupReportsByWindows(reports []entity.DailyReport) map[
 	return windows
 }
 
-// sortWindows sorts window times in ascending order
 func (s *exportService) sortWindows(windows map[time.Time][]entity.DailyReport) []time.Time {
 	var sorted []time.Time
 	for windowTime := range windows {
 		sorted = append(sorted, windowTime)
 	}
 
-	// Use Go's built-in sort for better performance
 	sort.Slice(sorted, func(i, j int) bool {
 		return sorted[i].Before(sorted[j])
 	})
@@ -638,12 +837,9 @@ func (s *exportService) sortWindows(windows map[time.Time][]entity.DailyReport) 
 	return sorted
 }
 
-// filterCumulativeDataUpToWindow filters reports up to and including the specified window time
-// Ensures timezone consistency for proper filtering
 func (s *exportService) filterCumulativeDataUpToWindow(allReports []entity.DailyReport, windowTime time.Time) []entity.DailyReport {
 	var cumulativeReports []entity.DailyReport
 
-	// Convert windowTime to Jakarta timezone for comparison
 	jakartaWindowTime := windowTime.In(config.GetJakartaTimezone())
 	for _, report := range allReports {
 		reportTime, err := time.Parse(time.RFC3339, report.Date)
@@ -652,7 +848,6 @@ func (s *exportService) filterCumulativeDataUpToWindow(allReports []entity.Daily
 			continue
 		}
 
-		// Convert reportTime to Jakarta timezone for comparison
 		jakartaReportTime := reportTime.In(config.GetJakartaTimezone())
 
 		if jakartaReportTime.Before(jakartaWindowTime) || jakartaReportTime.Equal(jakartaWindowTime) {
@@ -663,7 +858,6 @@ func (s *exportService) filterCumulativeDataUpToWindow(allReports []entity.Daily
 	return cumulativeReports
 }
 
-// countFileRecords counts the number of data records in a CSV file (excluding header)
 func (s *exportService) countFileRecords(filePath string) int {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -673,7 +867,7 @@ func (s *exportService) countFileRecords(filePath string) int {
 	defer file.Close()
 
 	lineCount := 0
-	buffer := make([]byte, 32*1024) // 32KB buffer for efficient reading
+	buffer := make([]byte, 32*1024)
 
 	for {
 		bytesRead, err := file.Read(buffer)
@@ -688,7 +882,7 @@ func (s *exportService) countFileRecords(filePath string) int {
 		}
 	}
 
-	// Subtract 1 for header line if file has content
+	// Subtract header line if exists
 	if lineCount > 0 {
 		lineCount--
 	}

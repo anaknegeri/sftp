@@ -45,7 +45,6 @@ type ConsumerConfig struct {
 }
 
 func NewNATSWorker(natsURL string, exportService service.ExportService, sftpService service.SFTPService, lateDataService service.LateDataService) (*NATSWorker, error) {
-	// Validate services are not nil
 	if exportService == nil {
 		return nil, fmt.Errorf("exportService cannot be nil")
 	}
@@ -56,7 +55,6 @@ func NewNATSWorker(natsURL string, exportService service.ExportService, sftpServ
 		return nil, fmt.Errorf("lateDataService cannot be nil")
 	}
 
-	// Connection options
 	opts := []nats.Option{
 		nats.Name("jarvist-sftp-worker"),
 		nats.ReconnectWait(2 * time.Second),
@@ -70,13 +68,11 @@ func NewNATSWorker(natsURL string, exportService service.ExportService, sftpServ
 		}),
 	}
 
-	// Connect
 	nc, err := nats.Connect(natsURL, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to NATS: %w", err)
 	}
 
-	// Create JetStream context
 	js, err := nc.JetStream()
 	if err != nil {
 		nc.Close()
@@ -100,7 +96,6 @@ func NewNATSWorker(natsURL string, exportService service.ExportService, sftpServ
 func (w *NATSWorker) Start() error {
 	log.Println("[WORKER] Starting NATS worker")
 
-	// Define consumers
 	consumers := map[string]ConsumerConfig{
 		"generate-report": {
 			Subject:     SubjectGenerateReport,
@@ -128,7 +123,6 @@ func (w *NATSWorker) Start() error {
 		},
 	}
 
-	// Start all consumers
 	for name, config := range consumers {
 		if err := w.startConsumer(name, config); err != nil {
 			return fmt.Errorf("failed to start consumer %s: %w", name, err)
@@ -153,7 +147,6 @@ func (w *NATSWorker) startConsumer(name string, config ConsumerConfig) error {
 		config.MaxDeliver = len(backoffValues) + 1
 	}
 
-	// Create consumer config
 	consumerCfg := &nats.ConsumerConfig{
 		Durable:       consumerName,
 		Description:   fmt.Sprintf("Durable consumer for %s messages", name),
@@ -168,7 +161,6 @@ func (w *NATSWorker) startConsumer(name string, config ConsumerConfig) error {
 		MaxWaiting:    1000,
 	}
 
-	// Add consumer
 	_, err := w.js.AddConsumer(streamName, consumerCfg)
 	if err != nil {
 		if !strings.Contains(err.Error(), "consumer already exists") &&
@@ -178,7 +170,6 @@ func (w *NATSWorker) startConsumer(name string, config ConsumerConfig) error {
 		log.Printf("[WORKER] Consumer already exists: %s", consumerName)
 	}
 
-	// Create pull subscription
 	sub, err := w.js.PullSubscribe(config.Subject, consumerName,
 		nats.Bind(streamName, consumerName),
 		nats.ManualAck(),
@@ -187,12 +178,10 @@ func (w *NATSWorker) startConsumer(name string, config ConsumerConfig) error {
 		return fmt.Errorf("failed to create subscription for %s: %w", name, err)
 	}
 
-	// Store subscription
 	w.mu.Lock()
 	w.subs[name] = sub
 	w.mu.Unlock()
 
-	// Start workers
 	for workerID := 0; workerID < config.Concurrency; workerID++ {
 		w.wg.Add(1)
 		go w.processMessages(name, sub, config, workerID)
@@ -239,13 +228,9 @@ func (w *NATSWorker) processMessage(msg *nats.Msg, handler func(*nats.Msg), cons
 			log.Printf("[WORKER] Message processing panicked in %s worker %d: %v", consumerName, workerID, r)
 			log.Printf("[WORKER] Stack trace: %s", debug.Stack())
 
-			// Log message details for debugging
 			if msg != nil {
 				log.Printf("[WORKER] Failed message subject: %s", msg.Subject)
 				log.Printf("[WORKER] Failed message data: %s", string(msg.Data))
-			}
-
-			if msg != nil {
 				msg.Nak()
 			}
 		}
@@ -262,7 +247,6 @@ func (w *NATSWorker) processMessage(msg *nats.Msg, handler func(*nats.Msg), cons
 			}
 		}()
 
-		// Additional nil check
 		if handler == nil {
 			done <- fmt.Errorf("handler is nil")
 			return
@@ -298,7 +282,6 @@ func (w *NATSWorker) processMessage(msg *nats.Msg, handler func(*nats.Msg), cons
 	}
 }
 
-// Message handlers with improved error handling
 func (w *NATSWorker) handleGenerateReport(msg *nats.Msg) {
 	if w.exportService == nil {
 		log.Printf("[WORKER] exportService is nil in handleGenerateReport")
@@ -324,7 +307,6 @@ func (w *NATSWorker) handleLateDataCheck(msg *nats.Msg) {
 }
 
 func (w *NATSWorker) processNATSMessage(msg *nats.Msg, processor func([]byte) error, messageType string) {
-	// Add nil checks
 	if msg == nil {
 		log.Printf("[WORKER] Message is nil in processNATSMessage for %s", messageType)
 		return
@@ -371,7 +353,6 @@ func (w *NATSWorker) processNATSMessage(msg *nats.Msg, processor func([]byte) er
 	}
 }
 
-// Task processors with improved error handling
 func (w *NATSWorker) handleGenerateReportTask(data []byte) error {
 	if data == nil {
 		return fmt.Errorf("data is nil")
@@ -386,7 +367,6 @@ func (w *NATSWorker) handleGenerateReportTask(data []byte) error {
 		return fmt.Errorf("failed to unmarshal generate report job: %w", err)
 	}
 
-	// Validate job data
 	if job.TenantID == "" {
 		return fmt.Errorf("tenantID is empty")
 	}
@@ -395,11 +375,40 @@ func (w *NATSWorker) handleGenerateReportTask(data []byte) error {
 		return fmt.Errorf("date is zero")
 	}
 
-	switch strings.ToLower(strings.TrimSpace(job.JobType)) {
-	case "daily":
+	jobType := strings.ToLower(strings.TrimSpace(job.JobType))
+	log.Printf("[WORKER] Processing generate report job: tenant=%s, date=%s, jobType=%s", job.TenantID, job.Date.Format("2006-01-02"), jobType)
+
+	switch {
+	case jobType == "daily":
 		return w.exportService.ExportDaily(job.TenantID, job.Date)
-	case "30min":
+
+	case jobType == "30min":
 		return w.exportService.Export30Min(job.TenantID, job.Date)
+
+	case strings.HasPrefix(jobType, "daily_location_"):
+		locationID := strings.TrimPrefix(jobType, "daily_location_")
+		if locationID == "" {
+			return fmt.Errorf("invalid location job type: %s", job.JobType)
+		}
+		log.Printf("[WORKER] Processing daily export for location: %s", locationID)
+		return w.exportService.ExportByLocationID(job.TenantID, locationID, job.Date)
+
+	case strings.HasPrefix(jobType, "30min_location_"):
+		locationID := strings.TrimPrefix(jobType, "30min_location_")
+		if locationID == "" {
+			return fmt.Errorf("invalid location job type: %s", job.JobType)
+		}
+		log.Printf("[WORKER] Processing 30min export for location: %s", locationID)
+		return w.exportService.Export30MinByLocationID(job.TenantID, locationID, job.Date)
+
+	case strings.HasPrefix(jobType, "complete_location_"):
+		locationID := strings.TrimPrefix(jobType, "complete_location_")
+		if locationID == "" {
+			return fmt.Errorf("invalid location job type: %s", job.JobType)
+		}
+		log.Printf("[WORKER] Processing complete export for location: %s", locationID)
+		return w.exportService.ExportAllReportByLocationID(job.TenantID, locationID, job.Date)
+
 	default:
 		return fmt.Errorf("unknown job type: %s", job.JobType)
 	}
@@ -419,7 +428,11 @@ func (w *NATSWorker) handleUploadSFTPTask(data []byte) error {
 		return fmt.Errorf("failed to unmarshal upload SFTP job: %w", err)
 	}
 
-	// Validate job data
+	// SIMPLIFIED: Validate required fields including LogID
+	if job.LogID == "" {
+		return fmt.Errorf("logID is empty")
+	}
+
 	if job.TenantID == "" {
 		return fmt.Errorf("tenantID is empty")
 	}
@@ -431,6 +444,8 @@ func (w *NATSWorker) handleUploadSFTPTask(data []byte) error {
 	if job.FilePath == "" {
 		return fmt.Errorf("filePath is empty")
 	}
+
+	log.Printf("[WORKER] Processing upload job for %s (log ID: %s)", job.FileName, job.LogID)
 
 	return w.sftpService.UploadFile(job)
 }
@@ -449,7 +464,6 @@ func (w *NATSWorker) handleLateDataCheckTask(data []byte) error {
 		return fmt.Errorf("failed to unmarshal late data check job: %w", err)
 	}
 
-	// Validate job data
 	if job.TenantID == "" {
 		return fmt.Errorf("tenantID is empty")
 	}
@@ -474,7 +488,6 @@ func (w *NATSWorker) Stop() error {
 
 	w.cancel()
 
-	// Unsubscribe
 	w.mu.Lock()
 	for name, sub := range w.subs {
 		if err := sub.Unsubscribe(); err != nil {
@@ -484,7 +497,6 @@ func (w *NATSWorker) Stop() error {
 	w.subs = make(map[string]*nats.Subscription)
 	w.mu.Unlock()
 
-	// Wait for workers
 	done := make(chan struct{})
 	go func() {
 		w.wg.Wait()
@@ -498,7 +510,6 @@ func (w *NATSWorker) Stop() error {
 		log.Println("[WORKER] Timeout waiting for workers")
 	}
 
-	// Close connection
 	if w.nc != nil && w.nc.IsConnected() {
 		w.nc.Close()
 	}

@@ -1,3 +1,4 @@
+// File: internal/grpc/grpc_sft_server.go - Async pattern to avoid timeouts
 package grpc
 
 import (
@@ -6,27 +7,31 @@ import (
 	"log"
 	"time"
 
+	"jarvist/sftp-service/internal/queue"
 	"jarvist/sftp-service/internal/service"
+	"jarvist/sftp-service/internal/types"
 	pb "jarvist/sftp-service/proto/sftp"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type SFTPGRPCServer struct {
 	pb.UnimplementedExportServiceServer
 	exportService service.ExportService
-	sftService    service.SFTPService
+	sftpService   service.SFTPService
+	jobQueue      queue.JobQueue // Add job queue for async operations
 }
 
-func NewSFTPGRPCServer(exportService service.ExportService, sftService service.SFTPService) *SFTPGRPCServer {
+func NewSFTPGRPCServer(exportService service.ExportService, sftpService service.SFTPService, jobQueue queue.JobQueue) *SFTPGRPCServer {
 	return &SFTPGRPCServer{
 		exportService: exportService,
-		sftService:    sftService,
+		sftpService:   sftpService,
+		jobQueue:      jobQueue,
 	}
 }
 
+// ASYNC: ExportDaily - Queue job and return immediately
 func (s *SFTPGRPCServer) ExportDaily(ctx context.Context, req *pb.ExportDailyRequest) (*pb.ExportResponse, error) {
 	log.Printf("[GRPC] ExportDaily request received for tenant: %s", req.TenantId)
 
@@ -39,21 +44,30 @@ func (s *SFTPGRPCServer) ExportDaily(ctx context.Context, req *pb.ExportDailyReq
 		return nil, status.Error(codes.InvalidArgument, "invalid date format, use YYYY-MM-DD")
 	}
 
-	if err := s.exportService.ExportDaily(req.TenantId, date); err != nil {
-		log.Printf("[GRPC] ExportDaily failed for tenant %s: %v", req.TenantId, err)
+	// ASYNC: Queue job instead of direct processing
+	job := types.GenerateReportJob{
+		TenantID:  req.TenantId,
+		Date:      date,
+		JobType:   "daily",
+		CreatedAt: time.Now(),
+	}
+
+	if err := s.jobQueue.PublishJob(types.SubjectGenerateReport, job); err != nil {
+		log.Printf("[GRPC] Failed to queue daily export job for tenant %s: %v", req.TenantId, err)
 		return &pb.ExportResponse{
 			Success: false,
-			Message: fmt.Sprintf("Export failed: %v", err),
+			Message: fmt.Sprintf("Failed to queue export job: %v", err),
 		}, nil
 	}
 
-	log.Printf("[GRPC] ExportDaily completed successfully for tenant: %s", req.TenantId)
+	log.Printf("[GRPC] Daily export job queued successfully for tenant: %s", req.TenantId)
 	return &pb.ExportResponse{
 		Success: true,
-		Message: "Daily export completed successfully",
+		Message: fmt.Sprintf("Daily export job queued successfully for %s. Processing will start shortly.", req.Date),
 	}, nil
 }
 
+// ASYNC: Export30Min - Queue job and return immediately
 func (s *SFTPGRPCServer) Export30Min(ctx context.Context, req *pb.Export30MinRequest) (*pb.ExportResponse, error) {
 	log.Printf("[GRPC] Export30Min request received for tenant: %s", req.TenantId)
 
@@ -61,26 +75,38 @@ func (s *SFTPGRPCServer) Export30Min(ctx context.Context, req *pb.Export30MinReq
 		return nil, err
 	}
 
-	triggerTime, err := time.Parse("2006-01-02", req.DateTime)
+	triggerTime, err := time.Parse("2006-01-02 15:04", req.DateTime)
 	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, "invalid date format, use YYYY-MM-DD")
+		// Try with date only format
+		triggerTime, err = time.Parse("2006-01-02", req.DateTime)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "invalid datetime format, use YYYY-MM-DD HH:MM or YYYY-MM-DD")
+		}
 	}
 
-	if err := s.exportService.Export30Min(req.TenantId, triggerTime); err != nil {
-		log.Printf("[GRPC] Export30Min failed for tenant %s: %v", req.TenantId, err)
+	job := types.GenerateReportJob{
+		TenantID:  req.TenantId,
+		Date:      triggerTime,
+		JobType:   "30min",
+		CreatedAt: time.Now(),
+	}
+
+	if err := s.jobQueue.PublishJob(types.SubjectGenerateReport, job); err != nil {
+		log.Printf("[GRPC] Failed to queue 30min export job for tenant %s: %v", req.TenantId, err)
 		return &pb.ExportResponse{
 			Success: false,
-			Message: fmt.Sprintf("30-minute export failed: %v", err),
+			Message: fmt.Sprintf("Failed to queue export job: %v", err),
 		}, nil
 	}
 
-	log.Printf("[GRPC] Export30Min completed successfully for tenant: %s", req.TenantId)
+	log.Printf("[GRPC] 30min export job queued successfully for tenant: %s", req.TenantId)
 	return &pb.ExportResponse{
 		Success: true,
-		Message: "30-minute export completed successfully",
+		Message: fmt.Sprintf("30-minute export job queued successfully for %s. Processing will start shortly.", req.DateTime),
 	}, nil
 }
 
+// ASYNC: ExportAllReport - Queue job and return immediately
 func (s *SFTPGRPCServer) ExportAllReport(ctx context.Context, req *pb.ExportAllReportRequest) (*pb.ExportResponse, error) {
 	log.Printf("[GRPC] ExportAllReport request received for tenant: %s", req.TenantId)
 
@@ -93,21 +119,47 @@ func (s *SFTPGRPCServer) ExportAllReport(ctx context.Context, req *pb.ExportAllR
 		return nil, status.Error(codes.InvalidArgument, "invalid date format, use YYYY-MM-DD")
 	}
 
-	if err := s.exportService.ExportAllReport(req.TenantId, date); err != nil {
-		log.Printf("[GRPC] ExportAllReport failed for tenant %s: %v", req.TenantId, err)
+	// Queue both daily and 30min jobs
+	dailyJob := types.GenerateReportJob{
+		TenantID:  req.TenantId,
+		Date:      date,
+		JobType:   "daily",
+		CreatedAt: time.Now(),
+	}
+
+	thirtyMinJob := types.GenerateReportJob{
+		TenantID:  req.TenantId,
+		Date:      date,
+		JobType:   "30min",
+		CreatedAt: time.Now(),
+	}
+
+	// Queue daily job
+	if err := s.jobQueue.PublishJob(types.SubjectGenerateReport, dailyJob); err != nil {
+		log.Printf("[GRPC] Failed to queue daily job for tenant %s: %v", req.TenantId, err)
 		return &pb.ExportResponse{
 			Success: false,
-			Message: fmt.Sprintf("Complete export failed: %v", err),
+			Message: fmt.Sprintf("Failed to queue daily export job: %v", err),
 		}, nil
 	}
 
-	log.Printf("[GRPC] ExportAllReport completed successfully for tenant: %s", req.TenantId)
+	// Queue 30min job
+	if err := s.jobQueue.PublishJob(types.SubjectGenerateReport, thirtyMinJob); err != nil {
+		log.Printf("[GRPC] Failed to queue 30min job for tenant %s: %v", req.TenantId, err)
+		return &pb.ExportResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to queue 30min export job: %v", err),
+		}, nil
+	}
+
+	log.Printf("[GRPC] All export jobs queued successfully for tenant: %s", req.TenantId)
 	return &pb.ExportResponse{
 		Success: true,
-		Message: "Complete export completed successfully",
+		Message: fmt.Sprintf("Complete export jobs (daily + 30min) queued successfully for %s. Processing will start shortly.", req.Date),
 	}, nil
 }
 
+// ASYNC: ExportByLocationID - Queue job and return immediately
 func (s *SFTPGRPCServer) ExportByLocationID(ctx context.Context, req *pb.ExportByLocationIDRequest) (*pb.ExportResponse, error) {
 	log.Printf("[GRPC] ExportByLocationID request received for tenant: %s, location: %s",
 		req.TenantId, req.LocationId)
@@ -125,23 +177,32 @@ func (s *SFTPGRPCServer) ExportByLocationID(ctx context.Context, req *pb.ExportB
 		return nil, status.Error(codes.InvalidArgument, "invalid date format, use YYYY-MM-DD")
 	}
 
-	if err := s.exportService.ExportByLocationID(req.TenantId, req.LocationId, date); err != nil {
-		log.Printf("[GRPC] ExportByLocationID failed for tenant %s, location %s: %v",
+	// For location-specific exports, we can use a custom job type or add location info
+	job := types.GenerateReportJob{
+		TenantID:  req.TenantId,
+		Date:      date,
+		JobType:   fmt.Sprintf("daily_location_%s", req.LocationId), // Custom job type
+		CreatedAt: time.Now(),
+	}
+
+	if err := s.jobQueue.PublishJob(types.SubjectGenerateReport, job); err != nil {
+		log.Printf("[GRPC] Failed to queue location export job for tenant %s, location %s: %v",
 			req.TenantId, req.LocationId, err)
 		return &pb.ExportResponse{
 			Success: false,
-			Message: fmt.Sprintf("Daily export by location failed: %v", err),
+			Message: fmt.Sprintf("Failed to queue export job: %v", err),
 		}, nil
 	}
 
-	log.Printf("[GRPC] ExportByLocationID completed successfully for tenant: %s, location: %s",
+	log.Printf("[GRPC] Location export job queued successfully for tenant: %s, location: %s",
 		req.TenantId, req.LocationId)
 	return &pb.ExportResponse{
 		Success: true,
-		Message: "Daily export by location completed successfully",
+		Message: fmt.Sprintf("Daily export job for location %s queued successfully for %s. Processing will start shortly.", req.LocationId, req.Date),
 	}, nil
 }
 
+// ASYNC: Export30MinByLocationID
 func (s *SFTPGRPCServer) Export30MinByLocationID(ctx context.Context, req *pb.Export30MinByLocationIDRequest) (*pb.ExportResponse, error) {
 	log.Printf("[GRPC] Export30MinByLocationID request received for tenant: %s, location: %s",
 		req.TenantId, req.LocationId)
@@ -154,28 +215,39 @@ func (s *SFTPGRPCServer) Export30MinByLocationID(ctx context.Context, req *pb.Ex
 		return nil, err
 	}
 
-	triggerTime, err := time.Parse("2006-01-02", req.DateTime)
+	triggerTime, err := time.Parse("2006-01-02 15:04", req.DateTime)
 	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, "invalid date format, use YYYY-MM-DD")
+		triggerTime, err = time.Parse("2006-01-02", req.DateTime)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "invalid datetime format, use YYYY-MM-DD HH:MM or YYYY-MM-DD")
+		}
 	}
 
-	if err := s.exportService.Export30MinByLocationID(req.TenantId, req.LocationId, triggerTime); err != nil {
-		log.Printf("[GRPC] Export30MinByLocationID failed for tenant %s, location %s: %v",
+	job := types.GenerateReportJob{
+		TenantID:  req.TenantId,
+		Date:      triggerTime,
+		JobType:   fmt.Sprintf("30min_location_%s", req.LocationId),
+		CreatedAt: time.Now(),
+	}
+
+	if err := s.jobQueue.PublishJob(types.SubjectGenerateReport, job); err != nil {
+		log.Printf("[GRPC] Failed to queue 30min location export job for tenant %s, location %s: %v",
 			req.TenantId, req.LocationId, err)
 		return &pb.ExportResponse{
 			Success: false,
-			Message: fmt.Sprintf("30-minute export by location failed: %v", err),
+			Message: fmt.Sprintf("Failed to queue export job: %v", err),
 		}, nil
 	}
 
-	log.Printf("[GRPC] Export30MinByLocationID completed successfully for tenant: %s, location: %s",
+	log.Printf("[GRPC] 30min location export job queued successfully for tenant: %s, location: %s",
 		req.TenantId, req.LocationId)
 	return &pb.ExportResponse{
 		Success: true,
-		Message: "30-minute export by location completed successfully",
+		Message: fmt.Sprintf("30-minute export job for location %s queued successfully for %s. Processing will start shortly.", req.LocationId, req.DateTime),
 	}, nil
 }
 
+// ASYNC: ExportAllReportByLocationID
 func (s *SFTPGRPCServer) ExportAllReportByLocationID(ctx context.Context, req *pb.ExportAllReportByLocationIDRequest) (*pb.ExportResponse, error) {
 	log.Printf("[GRPC] ExportAllReportByLocationID request received for tenant: %s, location: %s",
 		req.TenantId, req.LocationId)
@@ -193,20 +265,42 @@ func (s *SFTPGRPCServer) ExportAllReportByLocationID(ctx context.Context, req *p
 		return nil, status.Error(codes.InvalidArgument, "invalid date format, use YYYY-MM-DD")
 	}
 
-	if err := s.exportService.ExportAllReportByLocationID(req.TenantId, req.LocationId, date); err != nil {
-		log.Printf("[GRPC] ExportAllReportByLocationID failed for tenant %s, location %s: %v",
-			req.TenantId, req.LocationId, err)
+	// Queue both daily and 30min jobs for specific location
+	dailyJob := types.GenerateReportJob{
+		TenantID:  req.TenantId,
+		Date:      date,
+		JobType:   fmt.Sprintf("daily_location_%s", req.LocationId),
+		CreatedAt: time.Now(),
+	}
+
+	thirtyMinJob := types.GenerateReportJob{
+		TenantID:  req.TenantId,
+		Date:      date,
+		JobType:   fmt.Sprintf("30min_location_%s", req.LocationId),
+		CreatedAt: time.Now(),
+	}
+
+	if err := s.jobQueue.PublishJob(types.SubjectGenerateReport, dailyJob); err != nil {
+		log.Printf("[GRPC] Failed to queue daily location job: %v", err)
 		return &pb.ExportResponse{
 			Success: false,
-			Message: fmt.Sprintf("Complete export by location failed: %v", err),
+			Message: fmt.Sprintf("Failed to queue daily export job: %v", err),
 		}, nil
 	}
 
-	log.Printf("[GRPC] ExportAllReportByLocationID completed successfully for tenant: %s, location: %s",
+	if err := s.jobQueue.PublishJob(types.SubjectGenerateReport, thirtyMinJob); err != nil {
+		log.Printf("[GRPC] Failed to queue 30min location job: %v", err)
+		return &pb.ExportResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to queue 30min export job: %v", err),
+		}, nil
+	}
+
+	log.Printf("[GRPC] All location export jobs queued successfully for tenant: %s, location: %s",
 		req.TenantId, req.LocationId)
 	return &pb.ExportResponse{
 		Success: true,
-		Message: "Complete export by location completed successfully",
+		Message: fmt.Sprintf("Complete export jobs for location %s queued successfully for %s. Processing will start shortly.", req.LocationId, req.Date),
 	}, nil
 }
 
@@ -217,19 +311,38 @@ func (s *SFTPGRPCServer) UploadAllPendingFiles(ctx context.Context, req *pb.Uplo
 		return nil, err
 	}
 
-	if err := s.sftService.UploadAllPendingFiles(req.TenantId); err != nil {
-		log.Printf("[GRPC] UploadAllPendingFiles failed for tenant %s: %v", req.TenantId, err)
+	// Set shorter timeout for upload operations
+	uploadCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.sftpService.UploadAllPendingFiles(req.TenantId)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			log.Printf("[GRPC] UploadAllPendingFiles failed for tenant %s: %v", req.TenantId, err)
+			return &pb.ExportResponse{
+				Success: false,
+				Message: fmt.Sprintf("Upload failed: %v", err),
+			}, nil
+		}
+
+		log.Printf("[GRPC] UploadAllPendingFiles completed successfully for tenant: %s", req.TenantId)
+		return &pb.ExportResponse{
+			Success: true,
+			Message: "Upload all pending files completed successfully",
+		}, nil
+
+	case <-uploadCtx.Done():
+		log.Printf("[GRPC] UploadAllPendingFiles timeout for tenant: %s", req.TenantId)
 		return &pb.ExportResponse{
 			Success: false,
-			Message: fmt.Sprintf("Export failed: %v", err),
+			Message: "Upload operation timed out after 5 minutes. Files may still be uploading in background.",
 		}, nil
 	}
-
-	log.Printf("[GRPC] UploadAllPendingFiles completed successfully for tenant: %s", req.TenantId)
-	return &pb.ExportResponse{
-		Success: true,
-		Message: "Upload all pending files completed successfully",
-	}, nil
 }
 
 // Validation helpers
@@ -252,17 +365,4 @@ func (s *SFTPGRPCServer) HealthCheck(ctx context.Context, req *pb.HealthCheckReq
 		Ok:      true,
 		Message: "SFTP server is healthy",
 	}, nil
-}
-
-// Helper function to convert time to timestamp
-func TimeToTimestamp(t time.Time) *timestamppb.Timestamp {
-	return timestamppb.New(t)
-}
-
-// Helper function to convert timestamp to time
-func TimestampToTime(ts *timestamppb.Timestamp) time.Time {
-	if ts == nil {
-		return time.Time{}
-	}
-	return ts.AsTime()
 }

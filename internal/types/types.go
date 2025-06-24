@@ -28,6 +28,7 @@ type GenerateReportJob struct {
 }
 
 type UploadSFTPJob struct {
+	LogID      string    `json:"log_id"`
 	TenantID   string    `json:"tenant_id"`
 	FilePath   string    `json:"file_path"`
 	FileName   string    `json:"file_name"`

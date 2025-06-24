@@ -97,7 +97,7 @@ func main() {
 
 	// Start gRPC server
 	log.Printf("Starting gRPC server on port %s...", cfg.GRPCPort)
-	exportGRPCServer := grpcHandler.NewSFTPGRPCServer(exportService, sftpService)
+	exportGRPCServer := grpcHandler.NewSFTPGRPCServer(exportService, sftpService, jobQueue)
 	go func() {
 		if err := startGRPCServer(cfg, exportGRPCServer); err != nil {
 			log.Fatalf("Failed to start gRPC server: %v", err)

@@ -81,7 +81,7 @@ func (w *csvWriter) writeReport(tenantID, fileName string, reports []entity.Dail
 			report.LocationCode,
 			report.DeviceName,
 			t.Format("20060102"),
-			t.Format("1504"),
+			t.Format("150405"),
 			strconv.FormatInt(report.TotalIn, 10),
 			strconv.FormatInt(report.TotalOut, 10),
 		}
