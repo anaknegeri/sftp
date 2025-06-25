@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -553,21 +552,6 @@ func (s *sftpService) performUploadWithConnection(tenantConfig *config.TenantCon
 		return fmt.Errorf("failed to open local file: %w", err)
 	}
 	defer localFile.Close()
-
-	remoteDir := filepath.Dir(remotePath)
-	if remoteDir != "." && remoteDir != "/" {
-		remoteDir = strings.ReplaceAll(remoteDir, "\\", "/")
-		log.Printf("[SFTP] Creating remote directory: %s", remoteDir)
-
-		if _, err := conn.sftpClient.Stat(remoteDir); err != nil {
-			if err := conn.sftpClient.MkdirAll(remoteDir); err != nil {
-				conn.mu.Lock()
-				conn.isHealthy = false
-				conn.mu.Unlock()
-				return fmt.Errorf("failed to create remote directory %s: %w", remoteDir, err)
-			}
-		}
-	}
 
 	remoteFile, err := conn.sftpClient.OpenFile(remotePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {

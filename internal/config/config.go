@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -11,6 +12,14 @@ import (
 
 const (
 	TimezoneJakarta = "Asia/Jakarta"
+
+	DefaultQueryTimeout = 60 * time.Second
+	BulkQueryTimeout    = 300 * time.Second
+	LongQueryTimeout    = 600 * time.Second
+
+	DBConnectTimeout = 30 * time.Second
+	DBMaxIdleTime    = 2 * time.Minute
+	DBMaxLifetime    = 5 * time.Minute
 )
 
 type Config struct {
@@ -29,6 +38,10 @@ type Database struct {
 	Password string
 	SSLMode  string
 	Debug    bool
+
+	DefaultTimeout time.Duration
+	BulkTimeout    time.Duration
+	LongTimeout    time.Duration
 }
 
 type NATSConfig struct {
@@ -65,6 +78,10 @@ func Load() *Config {
 			Password: getEnv("DB_PASSWORD", ""),
 			SSLMode:  getEnv("DB_SSL_MODE", "disable"),
 			Debug:    getBoolEnv("DB_DEBUG", false),
+
+			DefaultTimeout: getDurationEnv("DB_DEFAULT_TIMEOUT", DefaultQueryTimeout),
+			BulkTimeout:    getDurationEnv("DB_BULK_TIMEOUT", BulkQueryTimeout),
+			LongTimeout:    getDurationEnv("DB_LONG_TIMEOUT", LongQueryTimeout),
 		},
 		NATS: NATSConfig{
 			URL:            getEnv("NATS_URL", "nats://localhost:4222"),
@@ -159,6 +176,21 @@ func getIntEnv(key string, defaultValue int) int {
 	}
 
 	return intValue
+}
+
+func getDurationEnv(key string, defaultValue time.Duration) time.Duration {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
+	}
+
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		log.Printf("Invalid duration for %s: %s, using default: %v", key, value, defaultValue)
+		return defaultValue
+	}
+
+	return duration
 }
 
 func GetJakartaTimezone() *time.Location {

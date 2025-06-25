@@ -40,7 +40,7 @@ func main() {
 	log.Println("Database connected successfully")
 
 	// Initialize repositories
-	peopleRepo := repository.NewPeopleCountRepository(db)
+	peopleRepo := repository.NewPeopleCountRepository(db, cfg)
 	sftpLogRepo := repository.NewSFTPLogRepository(db)
 	csvWriter := file.NewCSVWriter(cfg.LocalPath)
 

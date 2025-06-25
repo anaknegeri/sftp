@@ -205,7 +205,7 @@ func (s *exportService) releaseFileGenerationLock(key ExportKey) {
 }
 
 func (s *exportService) ExportAllReport(tenantID string, date time.Time) error {
-	log.Printf("[EXPORT] Starting complete export for tenant %s, date %s", tenantID, date.Format("2006-01-02"))
+	log.Printf("[EXPORT] Starting bulk complete export for tenant %s, date %s", tenantID, date.Format("2006-01-02"))
 
 	// Acquire global lock for tenant-wide operations
 	globalKey := ExportKey{
@@ -219,27 +219,51 @@ func (s *exportService) ExportAllReport(tenantID string, date time.Time) error {
 	}
 	defer s.releaseGlobalExportLock(globalKey)
 
+	// Get all locations first
 	locations, err := s.getLocations(tenantID)
 	if err != nil {
 		return err
 	}
 
+	// BULK: Get all reports for tenant at once
+	log.Printf("[EXPORT] Fetching all reports for tenant %s (bulk query)", tenantID)
+	allReports, err := s.peopleRepo.GetAllReportsForTenant(tenantID, date)
+	if err != nil {
+		return fmt.Errorf("failed to get all reports for tenant: %w", err)
+	}
+
+	if len(allReports) == 0 {
+		log.Printf("[EXPORT] No data found for tenant %s on %s", tenantID, date.Format("2006-01-02"))
+		return nil
+	}
+
+	log.Printf("[EXPORT] Fetched %d total records for %d locations", len(allReports), len(locations))
+
+	// Group reports by location
+	reportsByLocation := s.groupReportsByLocation(allReports)
+
 	successCount := 0
 	for _, location := range locations {
-		if err := s.processCompleteReport(tenantID, location, date); err != nil {
+		locationReports, exists := reportsByLocation[location.ID]
+		if !exists || len(locationReports) == 0 {
+			log.Printf("[EXPORT] No data for location %s on %s", location.LocationCode, date.Format("2006-01-02"))
+			continue
+		}
+
+		if err := s.processCompleteReportWithData(tenantID, location, date, locationReports); err != nil {
 			log.Printf("[EXPORT] Failed to process location %s: %v", location.LocationCode, err)
 			continue
 		}
 		successCount++
 	}
 
-	log.Printf("[EXPORT] Complete export finished for tenant %s: %d/%d locations processed successfully",
+	log.Printf("[EXPORT] Bulk complete export finished for tenant %s: %d/%d locations processed successfully",
 		tenantID, successCount, len(locations))
 	return nil
 }
 
 func (s *exportService) ExportDaily(tenantID string, date time.Time) error {
-	log.Printf("[DAILY] Starting daily export for tenant %s, date %s", tenantID, date.Format("2006-01-02"))
+	log.Printf("[DAILY] Starting bulk daily export for tenant %s, date %s", tenantID, date.Format("2006-01-02"))
 
 	// Acquire global lock for tenant-wide daily operations
 	globalKey := ExportKey{
@@ -253,27 +277,51 @@ func (s *exportService) ExportDaily(tenantID string, date time.Time) error {
 	}
 	defer s.releaseGlobalExportLock(globalKey)
 
+	// Get all locations first
 	locations, err := s.getLocations(tenantID)
 	if err != nil {
 		return err
 	}
 
+	// BULK: Get all reports for tenant at once
+	log.Printf("[DAILY] Fetching all reports for tenant %s (bulk query)", tenantID)
+	allReports, err := s.peopleRepo.GetAllReportsForTenant(tenantID, date)
+	if err != nil {
+		return fmt.Errorf("failed to get all reports for tenant: %w", err)
+	}
+
+	if len(allReports) == 0 {
+		log.Printf("[DAILY] No data found for tenant %s on %s", tenantID, date.Format("2006-01-02"))
+		return nil
+	}
+
+	log.Printf("[DAILY] Fetched %d total records for %d locations", len(allReports), len(locations))
+
+	// Group reports by location
+	reportsByLocation := s.groupReportsByLocation(allReports)
+
 	successCount := 0
 	for _, location := range locations {
-		if err := s.processDailyReport(tenantID, location, date); err != nil {
+		locationReports, exists := reportsByLocation[location.ID]
+		if !exists || len(locationReports) == 0 {
+			log.Printf("[DAILY] No data for location %s on %s", location.LocationCode, date.Format("2006-01-02"))
+			continue
+		}
+
+		if err := s.processDailyReportWithData(tenantID, location, date, locationReports); err != nil {
 			log.Printf("[DAILY] Failed to process location %s: %v", location.LocationCode, err)
 			continue
 		}
 		successCount++
 	}
 
-	log.Printf("[DAILY] Daily export completed for tenant %s: %d/%d locations processed successfully",
+	log.Printf("[DAILY] Bulk daily export completed for tenant %s: %d/%d locations processed successfully",
 		tenantID, successCount, len(locations))
 	return nil
 }
 
 func (s *exportService) Export30Min(tenantID string, triggerTime time.Time) error {
-	log.Printf("[30MIN] Starting 30-minute cumulative export for tenant %s, triggered at %s",
+	log.Printf("[30MIN] Starting bulk 30-minute cumulative export for tenant %s, triggered at %s",
 		tenantID, triggerTime.Format("2006-01-02 15:04"))
 
 	// Acquire global lock for tenant-wide 30min operations
@@ -288,21 +336,53 @@ func (s *exportService) Export30Min(tenantID string, triggerTime time.Time) erro
 	}
 	defer s.releaseGlobalExportLock(globalKey)
 
+	// Get all locations first
 	locations, err := s.getLocations(tenantID)
 	if err != nil {
 		return err
 	}
 
+	// BULK: Get all reports for tenant at once with time range
+	jakartaTriggerTime := triggerTime.In(config.GetJakartaTimezone())
+	today := time.Date(jakartaTriggerTime.Year(), jakartaTriggerTime.Month(), jakartaTriggerTime.Day(),
+		0, 0, 0, 0, config.GetJakartaTimezone())
+
+	log.Printf("[30MIN] Fetching all reports for tenant %s from %s to %s (bulk query)",
+		tenantID, today.Format("2006-01-02 15:04"), triggerTime.Format("2006-01-02 15:04"))
+
+	allReports, err := s.peopleRepo.GetAllReportsForTenantWithTimeRange(tenantID, today, triggerTime)
+	if err != nil {
+		return fmt.Errorf("failed to get all reports for tenant: %w", err)
+	}
+
+	if len(allReports) == 0 {
+		log.Printf("[30MIN] No cumulative data found for tenant %s up to %s",
+			tenantID, jakartaTriggerTime.Format("15:04"))
+		return nil
+	}
+
+	log.Printf("[30MIN] Fetched %d total records for %d locations", len(allReports), len(locations))
+
+	// Group reports by location
+	reportsByLocation := s.groupReportsByLocation(allReports)
+
 	successCount := 0
 	for _, location := range locations {
-		if err := s.process30MinReport(tenantID, location, triggerTime); err != nil {
+		locationReports, exists := reportsByLocation[location.ID]
+		if !exists || len(locationReports) == 0 {
+			log.Printf("[30MIN] No data for location %s up to %s",
+				location.LocationCode, jakartaTriggerTime.Format("15:04"))
+			continue
+		}
+
+		if err := s.process30MinReportWithData(tenantID, location, triggerTime, locationReports); err != nil {
 			log.Printf("[30MIN] Failed to process location %s: %v", location.LocationCode, err)
 			continue
 		}
 		successCount++
 	}
 
-	log.Printf("[30MIN] 30-minute cumulative export completed for tenant %s: %d/%d locations processed successfully",
+	log.Printf("[30MIN] Bulk 30-minute cumulative export completed for tenant %s: %d/%d locations processed successfully",
 		tenantID, successCount, len(locations))
 	return nil
 }
@@ -418,6 +498,135 @@ func (s *exportService) getLocations(tenantID string) ([]entity.Location, error)
 
 	log.Printf("[INFO] Found %d locations for tenant %s", len(locations), tenantID)
 	return locations, nil
+}
+
+func (s *exportService) groupReportsByLocation(allReports []entity.DailyReport) map[string][]entity.DailyReport {
+	reportsByLocation := make(map[string][]entity.DailyReport)
+
+	for _, report := range allReports {
+		reportsByLocation[report.LocationID] = append(reportsByLocation[report.LocationID], report)
+	}
+
+	log.Printf("[EXPORT] Grouped reports: %d locations have data", len(reportsByLocation))
+	for locationID, reports := range reportsByLocation {
+		if len(reports) > 0 {
+			log.Printf("[EXPORT] Location %s (%s): %d records", reports[0].LocationCode, locationID, len(reports))
+		}
+	}
+
+	return reportsByLocation
+}
+
+func (s *exportService) processDailyReportWithData(tenantID string, location entity.Location, date time.Time, reports []entity.DailyReport) error {
+	exportKey := ExportKey{
+		TenantID:   tenantID,
+		LocationID: location.ID,
+		Date:       date.Format("20060102"),
+		Type:       "daily",
+	}
+
+	if !s.acquireExportLock(exportKey) {
+		log.Printf("[DAILY] Skipping duplicate export for location %s on %s", location.LocationCode, date.Format("2006-01-02"))
+		return nil
+	}
+	defer s.releaseExportLock(exportKey)
+
+	// Acquire file generation lock
+	if !s.acquireFileGenerationLock(exportKey) {
+		log.Printf("[DAILY] File generation already in progress for location %s", location.LocationCode)
+		return nil
+	}
+	defer s.releaseFileGenerationLock(exportKey)
+
+	log.Printf("[DAILY] Processing location %s for date %s (%d records)",
+		location.LocationCode, date.Format("2006-01-02"), len(reports))
+
+	filePath, err := s.csvWriter.WriteDailyReport(tenantID, location.LocationCode, reports, date)
+	if err != nil {
+		return fmt.Errorf("failed to write daily CSV for location %s: %w", location.LocationCode, err)
+	}
+
+	// Validate file was created properly
+	if !s.validateGeneratedFile(filePath) {
+		return fmt.Errorf("generated file is invalid: %s", filePath)
+	}
+
+	recordCount := s.countFileRecords(filePath)
+	log.Printf("[DAILY] Created file: %s (%d records)", filePath, recordCount)
+
+	if err := s.createLogAndQueueUpload(tenantID, location.ID, filePath); err != nil {
+		log.Printf("[DAILY] Failed to queue upload for %s: %v", filePath, err)
+		return err
+	}
+
+	log.Printf("[DAILY] Daily export completed for location %s", location.LocationCode)
+	return nil
+}
+
+func (s *exportService) process30MinReportWithData(tenantID string, location entity.Location, triggerTime time.Time, allReports []entity.DailyReport) error {
+	jakartaTriggerTime := triggerTime.In(config.GetJakartaTimezone())
+	currentWindow := jakartaTriggerTime.Truncate(30 * time.Minute).Add(30 * time.Minute)
+
+	exportKey := ExportKey{
+		TenantID:   tenantID,
+		LocationID: location.ID,
+		Date:       jakartaTriggerTime.Format("20060102"),
+		Type:       "30min",
+		Window:     currentWindow.Format("1504"),
+	}
+
+	if !s.acquireExportLock(exportKey) {
+		log.Printf("[30MIN] Skipping duplicate export for location %s window %s",
+			location.LocationCode, currentWindow.Format("15:04"))
+		return nil
+	}
+	defer s.releaseExportLock(exportKey)
+
+	// Acquire file generation lock
+	if !s.acquireFileGenerationLock(exportKey) {
+		log.Printf("[30MIN] File generation already in progress for location %s window %s",
+			location.LocationCode, currentWindow.Format("15:04"))
+		return nil
+	}
+	defer s.releaseFileGenerationLock(exportKey)
+
+	log.Printf("[30MIN] Processing location %s for window %s (%d total records)",
+		location.LocationCode, currentWindow.Format("15:04"), len(allReports))
+
+	filePath, err := s.csvWriter.Write30MinReport(tenantID, location.LocationCode, allReports, currentWindow)
+	if err != nil {
+		return fmt.Errorf("failed to write 30-minute cumulative report for location %s: %w", location.LocationCode, err)
+	}
+
+	// Validate file was created properly
+	if !s.validateGeneratedFile(filePath) {
+		return fmt.Errorf("generated file is invalid: %s", filePath)
+	}
+
+	recordCount := s.countFileRecords(filePath)
+	log.Printf("[30MIN] Created file: %s (%d records)", filePath, recordCount)
+
+	if err := s.createLogAndQueueUpload(tenantID, location.ID, filePath); err != nil {
+		log.Printf("[30MIN] Failed to queue upload for %s: %v", filePath, err)
+		return err
+	}
+
+	log.Printf("[30MIN] 30-minute export completed for location %s at window %s",
+		location.LocationCode, currentWindow.Format("15:04"))
+	return nil
+}
+
+func (s *exportService) processCompleteReportWithData(tenantID string, location entity.Location, date time.Time, reports []entity.DailyReport) error {
+	log.Printf("[COMPLETE] Processing complete report for location %s on date %s (%d records)",
+		location.LocationCode, date.Format("2006-01-02"), len(reports))
+
+	// Process daily report first
+	if err := s.processDailyReportWithData(tenantID, location, date, reports); err != nil {
+		return fmt.Errorf("failed to process daily report: %w", err)
+	}
+
+	// Process 30min windows
+	return s.process30MinWindows(tenantID, location, reports)
 }
 
 func (s *exportService) processDailyReport(tenantID string, location entity.Location, date time.Time) error {
