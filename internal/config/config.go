@@ -204,3 +204,17 @@ func GetJakartaTimezone() *time.Location {
 func NowJakarta() time.Time {
 	return time.Now().In(GetJakartaTimezone())
 }
+
+type TimeRange struct {
+	StartTime time.Time
+	EndTime   time.Time
+}
+
+func BusinessHours(date time.Time) TimeRange {
+	jakartaDate := date.In(GetJakartaTimezone())
+
+	start := time.Date(jakartaDate.Year(), jakartaDate.Month(), jakartaDate.Day(), 8, 0, 0, 0, GetJakartaTimezone())
+	end := time.Date(jakartaDate.Year(), jakartaDate.Month(), jakartaDate.Day(), 23, 30, 0, 0, GetJakartaTimezone())
+
+	return TimeRange{StartTime: start, EndTime: end}
+}

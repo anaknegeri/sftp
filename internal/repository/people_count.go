@@ -79,7 +79,7 @@ func (r *peopleCountRepository) LocationExists(tenantID, locationID string) (boo
 }
 
 func (r *peopleCountRepository) GetReport(tenantID, locationID string, date time.Time) ([]entity.DailyReport, error) {
-	timeRange := NewDailyTimeRange(date)
+	timeRange := config.BusinessHours(date)
 	return r.executeReportQuery(tenantID, locationID, timeRange.StartTime, timeRange.EndTime)
 }
 
@@ -88,7 +88,7 @@ func (r *peopleCountRepository) GetReportWithTimeRange(tenantID, locationID stri
 }
 
 func (r *peopleCountRepository) GetAllReportsForTenant(tenantID string, date time.Time) ([]entity.DailyReport, error) {
-	timeRange := NewDailyTimeRange(date)
+	timeRange := config.BusinessHours(date)
 	return r.executeAllReportsQuery(tenantID, timeRange.StartTime, timeRange.EndTime)
 }
 

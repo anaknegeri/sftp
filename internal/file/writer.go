@@ -3,6 +3,7 @@ package file
 import (
 	"encoding/csv"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -47,6 +48,8 @@ func (w *csvWriter) WriteDailyReport(tenantID, locationCode string, reports []en
 }
 
 func (w *csvWriter) writeReport(tenantID, fileName string, reports []entity.DailyReport) (string, error) {
+	log.Printf("[CSV_WRITER] Starting to write %d reports to file %s", len(reports), fileName)
+
 	if len(reports) == 0 {
 		return "", fmt.Errorf("no data to export")
 	}
@@ -71,10 +74,15 @@ func (w *csvWriter) writeReport(tenantID, fileName string, reports []entity.Dail
 		return "", fmt.Errorf("failed to write header: %w", err)
 	}
 
-	for _, report := range reports {
-		t, err := time.Parse(time.RFC3339, report.Date)
+	successCount := 0
+	errorCount := 0
+
+	for i, report := range reports {
+		t, err := w.parsePostgreSQLTimestamp(report.Date)
 		if err != nil {
-			return "", fmt.Errorf("failed to parse date: %w", err)
+			errorCount++
+			log.Printf("[CSV_WRITER] ERROR: Failed to parse date for record %d: '%s' - %v", i+1, report.Date, err)
+			continue
 		}
 
 		row := []string{
@@ -87,9 +95,53 @@ func (w *csvWriter) writeReport(tenantID, fileName string, reports []entity.Dail
 		}
 
 		if err := csvWriter.Write(row); err != nil {
-			return "", fmt.Errorf("failed to write row: %w", err)
+			errorCount++
+			log.Printf("[CSV_WRITER] ERROR: Failed to write record %d: %v", i+1, err)
+			continue
 		}
+
+		successCount++
+	}
+
+	log.Printf("[CSV_WRITER] Completed writing %s: %d success, %d errors out of %d total",
+		fileName, successCount, errorCount, len(reports))
+
+	if successCount == 0 {
+		return "", fmt.Errorf("no valid records written to file - all %d records had errors", len(reports))
 	}
 
 	return filePath, nil
+}
+
+func (w *csvWriter) parsePostgreSQLTimestamp(dateStr string) (time.Time, error) {
+	if dateStr == "" {
+		return time.Time{}, fmt.Errorf("empty date string")
+	}
+
+	formats := []string{
+		"2006-01-02 15:04:05+07",    // "2025-06-24 08:30:00+07" (exact match)
+		"2006-01-02 15:04:05-07",    // Negative timezone
+		"2006-01-02 15:04:05Z",      // UTC
+		"2006-01-02 15:04:05",       // Tanpa timezone
+		"2006-01-02T15:04:05+07:00", // RFC3339 format
+		"2006-01-02T15:04:05Z",      // RFC3339 UTC
+		time.RFC3339,                // Standard RFC3339
+		time.RFC3339Nano,            // RFC3339 with nanoseconds
+	}
+
+	var lastErr error
+	for _, format := range formats {
+		if t, err := time.Parse(format, dateStr); err == nil {
+			// Jika sudah ada timezone info (+07), jangan konversi lagi
+			// Hanya konversi ke Jakarta jika tidak ada timezone info
+			if format == "2006-01-02 15:04:05" {
+				return t.In(jakartaLocation), nil
+			}
+			return t, nil
+		} else {
+			lastErr = err
+		}
+	}
+
+	return time.Time{}, fmt.Errorf("failed to parse PostgreSQL timestamp '%s' with any known format: %w", dateStr, lastErr)
 }
