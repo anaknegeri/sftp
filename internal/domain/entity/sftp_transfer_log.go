@@ -7,6 +7,13 @@ const (
 	FileTypeDaily = "DAILY"
 )
 
+const (
+	StatusPending  = "PENDING"
+	StatusSuccess  = "SUCCESS"
+	StatusFailed   = "FAILED"
+	StatusReplaced = "REPLACED"
+)
+
 type SFTPTransferLog struct {
 	ID                string     `gorm:"type:uuid;primaryKey"`
 	TenantID          string     `gorm:"type:varchar(50);not null"`
@@ -22,4 +29,24 @@ type SFTPTransferLog struct {
 	RecordCount       *int       `gorm:"type:int"`
 	FileType          string     `gorm:"type:varchar(50);not null"`
 	CreatedAt         time.Time  `gorm:"type:timestamp;default:current_timestamp"`
+}
+
+func (log *SFTPTransferLog) IsSuccessful() bool {
+	return log.Status == StatusSuccess
+}
+
+func (log *SFTPTransferLog) IsPending() bool {
+	return log.Status == StatusPending
+}
+
+func (log *SFTPTransferLog) IsFailed() bool {
+	return log.Status == StatusFailed
+}
+
+func (log *SFTPTransferLog) IsReplaced() bool {
+	return log.Status == StatusReplaced
+}
+
+func (log *SFTPTransferLog) IsActive() bool {
+	return log.Status == StatusSuccess || log.Status == StatusPending
 }

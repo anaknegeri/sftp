@@ -70,8 +70,7 @@ func main() {
 	// Initialize services
 	exportService := service.NewExportService(peopleRepo, sftpLogRepo, csvWriter, cfg.LocalPath, jobQueue)
 	sftpService := service.NewSFTPService(sftpLogRepo, cfg.LocalPath)
-	lateDataService := service.NewLateDataService(peopleRepo, sftpLogRepo, csvWriter, cfg.LocalPath)
-	lateDataService.SetSFTPService(sftpService)
+	lateDataService := service.NewLateDataService(peopleRepo, sftpLogRepo, csvWriter, sftpService, cfg.LocalPath)
 
 	// Initialize NATS worker (for consuming jobs)
 	log.Println("Starting NATS worker...")

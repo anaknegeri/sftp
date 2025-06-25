@@ -1,4 +1,5 @@
-// File: internal/repository/sftp_log.go - Simplified version
+// ✅ ENHANCED: Add these methods to your SFTPLogRepository interface and implementation
+
 package repository
 
 import (
@@ -20,7 +21,10 @@ type SFTPLogRepository interface {
 	UpdateStatus(id, status string, errorMessage *string) error
 	GetRecentByFileName(fileName string, since time.Duration) ([]*entity.SFTPTransferLog, error)
 
-	// Optional methods for admin/monitoring
+	GetRecentByFilePattern(tenantID, locationID, filePattern string, since time.Duration) ([]*entity.SFTPTransferLog, error)
+	GetExistingWindowsForLocation(tenantID, locationID, dateStr string, since time.Duration) ([]*entity.SFTPTransferLog, error)
+	BatchUpdateStatus(ids []string, status string, errorMessage *string) error
+
 	GetPendingCount(tenantID string) (int64, error)
 	GetSuccessCount(tenantID string) (int64, error)
 	GetFailedCount(tenantID string) (int64, error)
@@ -34,50 +38,132 @@ func NewSFTPLogRepository(db *gorm.DB) SFTPLogRepository {
 	return &sftpLogRepository{db: db}
 }
 
+func (r *sftpLogRepository) GetRecentByFilePattern(tenantID, locationID, filePattern string, since time.Duration) ([]*entity.SFTPTransferLog, error) {
+	var logs []*entity.SFTPTransferLog
+	cutoffTime := time.Now().Add(-since)
+
+	query := r.db.Where("tenant_id = ? AND location_id = ? AND file_name LIKE ? AND created_at > ?",
+		tenantID, locationID, filePattern+"%", cutoffTime).
+		Order("created_at DESC")
+
+	result := query.Find(&logs)
+	if result.Error != nil {
+		log.Printf("[REPO] ERROR querying pattern %s: %v", filePattern, result.Error)
+		return nil, result.Error
+	}
+
+	log.Printf("[REPO] Found %d files matching pattern %s for tenant %s", len(logs), filePattern, tenantID)
+	return logs, nil
+}
+
+func (r *sftpLogRepository) GetExistingWindowsForLocation(tenantID, locationID, dateStr string, since time.Duration) ([]*entity.SFTPTransferLog, error) {
+	var logs []*entity.SFTPTransferLog
+	cutoffTime := time.Now().Add(-since)
+
+	pattern := fmt.Sprintf("%%_%s_%%.csv", dateStr)
+
+	query := r.db.Where(`tenant_id = ? AND location_id = ? AND file_name LIKE ?
+		AND created_at > ? AND status IN ('SUCCESS', 'PENDING')
+		AND file_type = '30MIN'`,
+		tenantID, locationID, pattern, cutoffTime).
+		Order("file_name ASC")
+
+	result := query.Find(&logs)
+	if result.Error != nil {
+		log.Printf("[REPO] ERROR querying existing windows for %s: %v", locationID, result.Error)
+		return nil, result.Error
+	}
+
+	log.Printf("[REPO] Found %d existing 30min windows for location %s on date %s",
+		len(logs), locationID, dateStr)
+	return logs, nil
+}
+
+func (r *sftpLogRepository) BatchUpdateStatus(ids []string, status string, errorMessage *string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	updateData := map[string]interface{}{
+		"status":            status,
+		"transfer_end_time": time.Now(),
+	}
+
+	if errorMessage != nil {
+		updateData["error_message"] = *errorMessage
+	} else {
+		updateData["error_message"] = nil
+	}
+
+	result := r.db.Model(&entity.SFTPTransferLog{}).
+		Where("id IN ?", ids).
+		Updates(updateData)
+
+	if result.Error != nil {
+		log.Printf("[REPO] ❌ Batch update failed for %d records: %v", len(ids), result.Error)
+		return result.Error
+	}
+
+	log.Printf("[REPO] ✅ Batch updated %d records to status %s", result.RowsAffected, status)
+	return nil
+}
+
+func (r *sftpLogRepository) GetRecentByFileName(fileName string, since time.Duration) ([]*entity.SFTPTransferLog, error) {
+	var logs []*entity.SFTPTransferLog
+	cutoffTime := time.Now().Add(-since)
+
+	result := r.db.Where("file_name = ? AND created_at > ?", fileName, cutoffTime).
+		Order("created_at DESC").
+		Limit(10).
+		Find(&logs)
+
+	if result.Error != nil {
+		log.Printf("[REPO] ERROR querying recent files %s: %v", fileName, result.Error)
+		return nil, result.Error
+	}
+
+	if len(logs) > 3 {
+		log.Printf("[REPO] Found %d recent uploads for %s", len(logs), fileName)
+	}
+
+	return logs, nil
+}
+
 func (r *sftpLogRepository) Create(sftpLog *entity.SFTPTransferLog) error {
 	if err := r.db.Create(sftpLog).Error; err != nil {
 		log.Printf("[REPO] Failed to create log entry for %s: %v", sftpLog.FileName, err)
 		return err
 	}
 
-	log.Printf("[REPO] ✅ Created log entry: %s (ID: %s)", sftpLog.FileName, sftpLog.ID)
 	return nil
 }
 
 func (r *sftpLogRepository) Update(sftpLog *entity.SFTPTransferLog) error {
 	if err := r.db.Save(sftpLog).Error; err != nil {
-		log.Printf("[REPO] Failed to update log entry %s: %v", sftpLog.ID, err)
+		log.Printf("[REPO] ❌  Failed to update log entry %s: %v", sftpLog.ID, err)
 		return err
 	}
 
-	log.Printf("[REPO] ✅ Updated log entry: %s (ID: %s)", sftpLog.FileName, sftpLog.ID)
+	log.Printf("[REPO] ✅ Successfully to update log entry %s: %v", sftpLog.ID, sftpLog.Status)
 	return nil
 }
 
-// SIMPLIFIED: GetByID for direct log access using LogID
 func (r *sftpLogRepository) GetByID(id string) (*entity.SFTPTransferLog, error) {
-	log.Printf("[REPO] Looking for log by ID: %s", id)
-
 	var logEntry entity.SFTPTransferLog
 	result := r.db.Where("id = ?", id).First(&logEntry)
 
 	if result.Error != nil {
 		if result.Error == gorm.ErrRecordNotFound {
-			log.Printf("[REPO] No record found for ID: %s", id)
 			return nil, nil
 		}
 		log.Printf("[REPO] ERROR querying ID %s: %v", id, result.Error)
 		return nil, result.Error
 	}
 
-	log.Printf("[REPO] Found record for ID %s: FileName=%s, Status=%s",
-		id, logEntry.FileName, logEntry.Status)
 	return &logEntry, nil
 }
 
 func (r *sftpLogRepository) GetByFileName(fileName string) (*entity.SFTPTransferLog, error) {
-	log.Printf("[REPO] Looking for file: %s", fileName)
-
 	var logEntry entity.SFTPTransferLog
 	result := r.db.Where("file_name = ?", fileName).
 		Order("created_at DESC").
@@ -85,21 +171,16 @@ func (r *sftpLogRepository) GetByFileName(fileName string) (*entity.SFTPTransfer
 
 	if result.Error != nil {
 		if result.Error == gorm.ErrRecordNotFound {
-			log.Printf("[REPO] No record found for file: %s", fileName)
 			return nil, nil
 		}
 		log.Printf("[REPO] ERROR querying file %s: %v", fileName, result.Error)
 		return nil, result.Error
 	}
 
-	log.Printf("[REPO] Found record for %s: ID=%s, Status=%s, Created=%v",
-		fileName, logEntry.ID, logEntry.Status, logEntry.CreatedAt)
 	return &logEntry, nil
 }
 
 func (r *sftpLogRepository) GetPendingUploads(tenantID string) ([]*entity.SFTPTransferLog, error) {
-	log.Printf("[REPO] GetPendingUploads called for tenant: %s", tenantID)
-
 	var logs []*entity.SFTPTransferLog
 
 	query := r.db.Where("tenant_id = ? AND status = ?", tenantID, "PENDING").
@@ -111,27 +192,18 @@ func (r *sftpLogRepository) GetPendingUploads(tenantID string) ([]*entity.SFTPTr
 
 	result := query.Find(&logs)
 	if result.Error != nil {
-		log.Printf("[REPO] ❌ GetPendingUploads failed: %v", result.Error)
+		log.Printf("[REPO] GetPendingUploads failed: %v", result.Error)
 		return nil, result.Error
 	}
 
-	log.Printf("[REPO] ✅ GetPendingUploads found %d pending files for tenant %s", len(logs), tenantID)
-
-	if len(logs) > 0 && len(logs) <= 5 {
-		log.Printf("[REPO] Sample pending files:")
-		for _, logEntry := range logs {
-			log.Printf("[REPO] - %s (ID: %s, created: %v)",
-				logEntry.FileName, logEntry.ID, logEntry.CreatedAt)
-		}
+	if len(logs) > 0 {
+		log.Printf("[REPO] Found %d pending files for tenant %s", len(logs), tenantID)
 	}
 
 	return logs, nil
 }
 
-// SIMPLIFIED: UpdateStatus using ID directly
 func (r *sftpLogRepository) UpdateStatus(id, status string, errorMessage *string) error {
-	log.Printf("[REPO] UpdateStatus called for ID %s to status %s", id, status)
-
 	updateData := map[string]interface{}{
 		"status":            status,
 		"transfer_end_time": time.Now(),
@@ -139,10 +211,8 @@ func (r *sftpLogRepository) UpdateStatus(id, status string, errorMessage *string
 
 	if errorMessage != nil {
 		updateData["error_message"] = *errorMessage
-		log.Printf("[REPO] Setting error_message: %s", *errorMessage)
 	} else {
 		updateData["error_message"] = nil
-		log.Printf("[REPO] Clearing error_message")
 	}
 
 	result := r.db.Model(&entity.SFTPTransferLog{}).
@@ -150,21 +220,21 @@ func (r *sftpLogRepository) UpdateStatus(id, status string, errorMessage *string
 		Updates(updateData)
 
 	if result.Error != nil {
-		log.Printf("[REPO] ❌ Update failed for ID %s: %v", id, result.Error)
+		log.Printf("[REPO] Update failed for ID %s: %v", id, result.Error)
 		return result.Error
 	}
 
 	if result.RowsAffected == 0 {
-		log.Printf("[REPO] ❌ No rows affected for ID %s - record may not exist", id)
 		return fmt.Errorf("no rows affected - record not found")
 	}
 
-	log.Printf("[REPO] ✅ Successfully updated ID %s to status %s (affected: %d rows)",
-		id, status, result.RowsAffected)
+	if status == "FAILED" || status == "REPLACED" {
+		log.Printf("[REPO] Updated ID %s to status %s", id, status)
+	}
 	return nil
 }
 
-// OPTIONAL: Admin/monitoring methods
+// Optional monitoring methods
 func (r *sftpLogRepository) GetPendingCount(tenantID string) (int64, error) {
 	var count int64
 	err := r.db.Model(&entity.SFTPTransferLog{}).
@@ -187,43 +257,4 @@ func (r *sftpLogRepository) GetFailedCount(tenantID string) (int64, error) {
 		Where("tenant_id = ? AND status = ?", tenantID, "FAILED").
 		Count(&count).Error
 	return count, err
-}
-
-func (r *sftpLogRepository) GetRecentByFileName(fileName string, since time.Duration) ([]*entity.SFTPTransferLog, error) {
-	log.Printf("[REPO] Looking for recent uploads of file: %s (within %v)", fileName, since)
-
-	var logs []*entity.SFTPTransferLog
-	cutoffTime := time.Now().Add(-since)
-
-	result := r.db.Where("file_name = ? AND created_at > ?", fileName, cutoffTime).
-		Order("created_at DESC").
-		Find(&logs)
-
-	if result.Error != nil {
-		log.Printf("[REPO] ERROR querying recent files %s: %v", fileName, result.Error)
-		return nil, result.Error
-	}
-
-	log.Printf("[REPO] Found %d recent uploads for %s", len(logs), fileName)
-
-	if len(logs) > 0 {
-		for i, logEntry := range logs {
-			if i >= 3 {
-				break
-			}
-			timeDiff := time.Since(logEntry.CreatedAt)
-			log.Printf("[REPO] - %s: size=%d, records=%v, status=%s (%.1f seconds ago)",
-				logEntry.ID, logEntry.FileSize,
-				func() int {
-					if logEntry.RecordCount != nil {
-						return *logEntry.RecordCount
-					} else {
-						return 0
-					}
-				}(),
-				logEntry.Status, timeDiff.Seconds())
-		}
-	}
-
-	return logs, nil
 }
