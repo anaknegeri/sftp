@@ -193,11 +193,12 @@ func (s *sftpService) uploadFileWithLogID(job types.UploadSFTPJob) UploadResult 
 		return UploadResult{LogID: job.LogID, FileName: job.FileName, Success: true, Error: nil}
 	}
 
-	// Update to PROCESSING status to prevent duplicates
-	if existingLog.Status != "PROCESSING" {
+	// FIXED: Only update to PROCESSING if not already PROCESSING to avoid conflicts
+	if existingLog.Status == "PENDING" {
 		processingMsg := "Upload in progress"
-		if updateErr := s.sftpLogRepo.UpdateStatus(job.LogID, "PROCESSING", &processingMsg); updateErr != nil {
+		if updateErr := s.updateStatusWithRetry(job.LogID, "PROCESSING", &processingMsg, 2); updateErr != nil {
 			log.Printf("[SFTP] WARN: Failed to update PROCESSING status for %s: %v", job.FileName, updateErr)
+			// Don't fail the upload, continue anyway
 		} else {
 			log.Printf("[SFTP] 🔄 PROCESSING: %s (log ID: %s)", job.FileName, job.LogID)
 		}
@@ -209,18 +210,29 @@ func (s *sftpService) uploadFileWithLogID(job types.UploadSFTPJob) UploadResult 
 
 		uploadErr = s.performUpload(job)
 		if uploadErr == nil {
-			// SUCCESS - update status with detailed logging
+			// SUCCESS - update status with enhanced retry logic
 			log.Printf("[SFTP] Upload completed successfully, updating database status for %s", job.FileName)
 
-			if updateErr := s.updateStatusWithRetry(job.LogID, "SUCCESS", nil, 3); updateErr != nil {
-				log.Printf("[SFTP] ERROR: Failed to update SUCCESS status for %s after %d retries: %v",
-					job.FileName, 3, updateErr)
-				// Don't fail the upload, just log the error
+			// FIXED: Enhanced retry with different strategies
+			if updateErr := s.updateStatusWithRetry(job.LogID, "SUCCESS", nil, 5); updateErr != nil {
+				log.Printf("[SFTP] ERROR: Failed to update SUCCESS status for %s after 5 retries: %v",
+					job.FileName, updateErr)
+
+				// CRITICAL: Log this as a critical issue but don't fail the upload
+				log.Printf("[SFTP] 🚨 CRITICAL: Upload succeeded but database update failed for %s", job.FileName)
+
+				// Try one final time with a longer delay
+				time.Sleep(5 * time.Second)
+				finalErr := s.sftpLogRepo.UpdateStatus(job.LogID, "SUCCESS", nil)
+				if finalErr != nil {
+					log.Printf("[SFTP] 🚨 FINAL DATABASE UPDATE FAILED for %s: %v", job.FileName, finalErr)
+				} else {
+					log.Printf("[SFTP] ✅ FINAL SUCCESS: Database updated for %s", job.FileName)
+				}
 			} else {
 				log.Printf("[SFTP] ✅ SUCCESS: %s (log ID: %s) - Database updated", job.FileName, job.LogID)
 			}
 
-			log.Printf("[SFTP] Upload successful for file %s", job.FileName)
 			return UploadResult{LogID: job.LogID, FileName: job.FileName, Success: true, Error: nil}
 		}
 
@@ -235,13 +247,13 @@ func (s *sftpService) uploadFileWithLogID(job types.UploadSFTPJob) UploadResult 
 		}
 	}
 
-	// FAILED after all retries - update status with detailed logging
+	// FAILED after all retries - update status with enhanced retry logic
 	log.Printf("[SFTP] Upload failed after %d attempts, updating database status for %s", maxRetries, job.FileName)
 
 	errorMsg := uploadErr.Error()
-	if updateErr := s.updateStatusWithRetry(job.LogID, "FAILED", &errorMsg, 3); updateErr != nil {
-		log.Printf("[SFTP] ERROR: Failed to update FAILED status for %s after %d retries: %v",
-			job.FileName, 3, updateErr)
+	if updateErr := s.updateStatusWithRetry(job.LogID, "FAILED", &errorMsg, 5); updateErr != nil {
+		log.Printf("[SFTP] ERROR: Failed to update FAILED status for %s after 5 retries: %v",
+			job.FileName, updateErr)
 	} else {
 		log.Printf("[SFTP] ❌ FINAL FAILURE: %s - %v (log ID: %s) - Database updated",
 			job.FileName, uploadErr, job.LogID)
@@ -263,17 +275,58 @@ func (s *sftpService) updateStatusWithRetry(logID, status string, errorMessage *
 			return nil
 		}
 
-		log.Printf("[SFTP] Database update attempt %d/%d failed for log ID %s: %v",
-			attempt, maxRetries, logID, updateErr)
+		// FIXED: Better error categorization
+		errorMsg := updateErr.Error()
+		isTimeoutError := strings.Contains(errorMsg, "timeout") ||
+			strings.Contains(errorMsg, "context deadline exceeded") ||
+			strings.Contains(errorMsg, "connection reset")
+
+		isTransactionError := strings.Contains(errorMsg, "transaction has already been committed") ||
+			strings.Contains(errorMsg, "transaction has already been rolled back") ||
+			strings.Contains(errorMsg, "deadlock detected")
+
+		log.Printf("[SFTP] Database update attempt %d/%d failed for log ID %s [%s]: %v", attempt, maxRetries, logID, s.categorizeError(updateErr), updateErr)
 
 		if attempt < maxRetries {
-			// Exponential backoff
-			delay := time.Duration(attempt) * 500 * time.Millisecond
+			// FIXED: Different retry strategies based on error type
+			var delay time.Duration
+			if isTimeoutError {
+				delay = time.Duration(attempt) * 2 * time.Second // Longer delay for timeouts
+			} else if isTransactionError {
+				delay = time.Duration(attempt) * 500 * time.Millisecond // Shorter delay for transaction conflicts
+			} else {
+				delay = time.Duration(attempt) * time.Second // Standard delay
+			}
+
+			log.Printf("[SFTP] Retrying database update in %v...", delay)
 			time.Sleep(delay)
 		}
 	}
 
 	return fmt.Errorf("failed after %d attempts: %w", maxRetries, updateErr)
+}
+
+func (s *sftpService) categorizeError(err error) string {
+	if err == nil {
+		return "none"
+	}
+
+	errorMsg := strings.ToLower(err.Error())
+
+	if strings.Contains(errorMsg, "timeout") || strings.Contains(errorMsg, "context deadline exceeded") {
+		return "timeout"
+	}
+	if strings.Contains(errorMsg, "transaction") || strings.Contains(errorMsg, "deadlock") {
+		return "transaction"
+	}
+	if strings.Contains(errorMsg, "connection") {
+		return "connection"
+	}
+	if strings.Contains(errorMsg, "not found") {
+		return "not_found"
+	}
+
+	return "unknown"
 }
 
 func (s *sftpService) shouldRetry(err error) bool {

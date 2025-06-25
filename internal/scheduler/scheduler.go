@@ -79,7 +79,6 @@ func (s *Scheduler) Start() error {
 
 	s.cron.Start()
 	log.Println("[SCHEDULER] Scheduler started successfully")
-	log.Println("[SCHEDULER] Upload jobs are handled automatically by export service (no separate upload scheduling)")
 	return nil
 }
 

@@ -85,6 +85,8 @@ func CreateQueryContext(queryType string, cfg *config.Config) (context.Context, 
 	var timeout time.Duration
 
 	switch queryType {
+	case "update":
+		timeout = 45 * time.Second
 	case "bulk":
 		timeout = cfg.Database.BulkTimeout
 	case "long":

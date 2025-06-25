@@ -1,3 +1,4 @@
+// File: internal/repository/sftp_log.go
 package repository
 
 import (
@@ -9,9 +10,9 @@ import (
 	"jarvist/sftp-service/internal/domain/entity"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
-// ACTUAL interface that's being used (based on your project)
 type SFTPLogRepository interface {
 	Create(log *entity.SFTPTransferLog) error
 	Update(log *entity.SFTPTransferLog) error
@@ -30,19 +31,23 @@ func NewSFTPLogRepository(db *gorm.DB) SFTPLogRepository {
 	return &sftpLogRepository{db: db}
 }
 
-// ENHANCED: UpdateStatus with detailed logging and retry mechanism
+// FIXED: UpdateStatus with proper timeout and retry handling
 func (r *sftpLogRepository) UpdateStatus(id, status string, errorMessage *string) error {
 	startTime := time.Now()
 
 	log.Printf("[REPO] Updating status for ID %s: -> %s", id, status)
 
-	// First, get current status for logging
+	// Get current status for logging
 	var currentLog entity.SFTPTransferLog
 	getCurrentResult := r.db.Where("id = ?", id).First(&currentLog)
 	currentStatus := "UNKNOWN"
 	if getCurrentResult.Error == nil {
 		currentStatus = currentLog.Status
 	}
+
+	// FIXED: Use longer timeout for database operations
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
 	updateData := map[string]interface{}{
 		"status":            status,
@@ -56,39 +61,68 @@ func (r *sftpLogRepository) UpdateStatus(id, status string, errorMessage *string
 		updateData["error_message"] = nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	// FIXED: Use transaction with proper locking to prevent conflicts
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// First, lock the row to prevent concurrent updates
+		var existing entity.SFTPTransferLog
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ?", id).
+			First(&existing).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return fmt.Errorf("record not found")
+			}
+			return fmt.Errorf("failed to lock record: %w", err)
+		}
 
-	result := r.db.WithContext(ctx).Model(&entity.SFTPTransferLog{}).
-		Where("id = ?", id).
-		Updates(updateData)
+		// Check if status has already changed to what we want
+		if existing.Status == status {
+			log.Printf("[REPO] Status already %s for ID %s, skipping update", status, id)
+			return nil
+		}
+
+		// Perform the update
+		result := tx.Model(&entity.SFTPTransferLog{}).
+			Where("id = ?", id).
+			Updates(updateData)
+
+		if result.Error != nil {
+			return fmt.Errorf("update failed: %w", result.Error)
+		}
+
+		if result.RowsAffected == 0 {
+			return fmt.Errorf("no rows affected - record may have been deleted")
+		}
+
+		return nil
+	})
 
 	duration := time.Since(startTime)
 
-	if result.Error != nil {
-		log.Printf("[REPO] ❌ UPDATE FAILED for ID %s (%s -> %s) after %v: %v",
-			id, currentStatus, status, duration, result.Error)
-		return result.Error
+	if err != nil {
+		// Check for specific timeout errors
+		if ctx.Err() == context.DeadlineExceeded {
+			log.Printf("[REPO] ❌ TIMEOUT: Update for ID %s (%s -> %s) after %v: context deadline exceeded",
+				id, currentStatus, status, duration)
+		} else {
+			log.Printf("[REPO] ❌ UPDATE FAILED for ID %s (%s -> %s) after %v: %v",
+				id, currentStatus, status, duration, err)
+		}
+		return err
 	}
 
-	if result.RowsAffected == 0 {
-		log.Printf("[REPO] ❌ NO ROWS AFFECTED for ID %s (%s -> %s) after %v - record not found",
-			id, currentStatus, status, duration)
-		return fmt.Errorf("no rows affected - record not found")
-	}
-
-	log.Printf("[REPO] ✅ SUCCESS: Updated ID %s (%s -> %s) in %v [%d rows affected]",
-		id, currentStatus, status, duration, result.RowsAffected)
+	log.Printf("[REPO] ✅ SUCCESS: Updated ID %s (%s -> %s) in %v",
+		id, currentStatus, status, duration)
 
 	return nil
 }
 
-// ENHANCED: GetByID with better logging
+// FIXED: GetByID with better timeout handling
 func (r *sftpLogRepository) GetByID(id string) (*entity.SFTPTransferLog, error) {
 	startTime := time.Now()
 	var logEntry entity.SFTPTransferLog
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Use shorter timeout for read operations
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	result := r.db.WithContext(ctx).Where("id = ?", id).First(&logEntry)
@@ -108,47 +142,56 @@ func (r *sftpLogRepository) GetByID(id string) (*entity.SFTPTransferLog, error) 
 	return &logEntry, nil
 }
 
-// ENHANCED: Create with better logging
+// FIXED: Create with better timeout and conflict handling
 func (r *sftpLogRepository) Create(sftpLog *entity.SFTPTransferLog) error {
 	startTime := time.Now()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	if err := r.db.WithContext(ctx).Create(sftpLog).Error; err != nil {
-		duration := time.Since(startTime)
+	// Use transaction to ensure consistency
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return tx.Create(sftpLog).Error
+	})
+
+	duration := time.Since(startTime)
+
+	if err != nil {
 		log.Printf("[REPO] ❌ CREATE FAILED for %s (ID: %s) after %v: %v",
 			sftpLog.FileName, sftpLog.ID, duration, err)
 		return err
 	}
 
-	duration := time.Since(startTime)
 	log.Printf("[REPO] ✅ CREATED: %s (ID: %s, Status: %s) in %v",
 		sftpLog.FileName, sftpLog.ID, sftpLog.Status, duration)
 	return nil
 }
 
-// ENHANCED: Update with better logging
+// FIXED: Update with better timeout handling
 func (r *sftpLogRepository) Update(sftpLog *entity.SFTPTransferLog) error {
 	startTime := time.Now()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	if err := r.db.WithContext(ctx).Save(sftpLog).Error; err != nil {
-		duration := time.Since(startTime)
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return tx.Save(sftpLog).Error
+	})
+
+	duration := time.Since(startTime)
+
+	if err != nil {
 		log.Printf("[REPO] ❌ UPDATE FAILED for %s (ID: %s) after %v: %v",
 			sftpLog.FileName, sftpLog.ID, duration, err)
 		return err
 	}
 
-	duration := time.Since(startTime)
 	log.Printf("[REPO] ✅ UPDATED: %s (ID: %s, Status: %s) in %v",
 		sftpLog.FileName, sftpLog.ID, sftpLog.Status, duration)
 	return nil
 }
 
-// ENHANCED: GetPendingUploads with better performance and logging
+// FIXED: GetPendingUploads with better performance and timeout
 func (r *sftpLogRepository) GetPendingUploads(tenantID string) ([]*entity.SFTPTransferLog, error) {
 	startTime := time.Now()
 	var logs []*entity.SFTPTransferLog
@@ -160,7 +203,7 @@ func (r *sftpLogRepository) GetPendingUploads(tenantID string) ([]*entity.SFTPTr
 		query = query.Where("tenant_id = ?", tenantID)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
 	result := query.WithContext(ctx).Find(&logs)
@@ -190,13 +233,13 @@ func (r *sftpLogRepository) GetPendingUploads(tenantID string) ([]*entity.SFTPTr
 	return logs, nil
 }
 
-// ENHANCED: GetRecentByFileName with better logging
+// FIXED: GetRecentByFileName with better timeout
 func (r *sftpLogRepository) GetRecentByFileName(fileName string, since time.Duration) ([]*entity.SFTPTransferLog, error) {
 	startTime := time.Now()
 	var logs []*entity.SFTPTransferLog
 	cutoffTime := time.Now().Add(-since)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	result := r.db.WithContext(ctx).Where("file_name = ? AND created_at > ?", fileName, cutoffTime).
@@ -218,12 +261,12 @@ func (r *sftpLogRepository) GetRecentByFileName(fileName string, since time.Dura
 	return logs, nil
 }
 
-// ENHANCED: GetByFileName with better logging
+// FIXED: GetByFileName with better timeout
 func (r *sftpLogRepository) GetByFileName(fileName string) (*entity.SFTPTransferLog, error) {
 	startTime := time.Now()
 	var logEntry entity.SFTPTransferLog
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	result := r.db.WithContext(ctx).Where("file_name = ?", fileName).
