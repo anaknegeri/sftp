@@ -1,3 +1,4 @@
+// File: internal/worker/worker.go - COMPLETE FIXED VERSION
 package worker
 
 import (
@@ -8,6 +9,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"jarvist/sftp-service/internal/service"
@@ -33,6 +35,15 @@ type NATSWorker struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
 	wg              sync.WaitGroup
+	processingJobs  sync.Map
+	healthTicker    *time.Ticker
+	isHealthy       int64
+}
+
+type ProcessingJob struct {
+	StartTime time.Time
+	WorkerID  int
+	LogID     string
 }
 
 type ConsumerConfig struct {
@@ -55,22 +66,46 @@ func NewNATSWorker(natsURL string, exportService service.ExportService, sftpServ
 		return nil, fmt.Errorf("lateDataService cannot be nil")
 	}
 
+	// Enhanced connection options with better monitoring
 	opts := []nats.Option{
 		nats.Name("jarvist-sftp-worker"),
-		nats.ReconnectWait(2 * time.Second),
+		nats.ReconnectWait(5 * time.Second),
 		nats.MaxReconnects(-1),
 		nats.Timeout(30 * time.Second),
+		nats.PingInterval(30 * time.Second),
+		nats.MaxPingsOutstanding(3),
 		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
 			log.Printf("[WORKER] NATS disconnected: %v", err)
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
 			log.Printf("[WORKER] NATS reconnected to %s", nc.ConnectedUrl())
 		}),
+		nats.ClosedHandler(func(nc *nats.Conn) {
+			log.Println("[WORKER] NATS connection closed")
+		}),
+		nats.ErrorHandler(func(nc *nats.Conn, sub *nats.Subscription, err error) {
+			log.Printf("[WORKER] NATS error: %v", err)
+		}),
 	}
 
-	nc, err := nats.Connect(natsURL, opts...)
+	var nc *nats.Conn
+	var err error
+
+	// Retry connection with backoff
+	maxRetries := 5
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		nc, err = nats.Connect(natsURL, opts...)
+		if err == nil {
+			break
+		}
+		log.Printf("[WORKER] Connection attempt %d failed: %v", attempt, err)
+		if attempt < maxRetries {
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
+	}
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to NATS: %w", err)
+		return nil, fmt.Errorf("failed to connect to NATS after %d attempts: %w", maxRetries, err)
 	}
 
 	js, err := nc.JetStream()
@@ -81,7 +116,7 @@ func NewNATSWorker(natsURL string, exportService service.ExportService, sftpServ
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	return &NATSWorker{
+	worker := &NATSWorker{
 		nc:              nc,
 		js:              js,
 		exportService:   exportService,
@@ -90,36 +125,115 @@ func NewNATSWorker(natsURL string, exportService service.ExportService, sftpServ
 		subs:            make(map[string]*nats.Subscription),
 		ctx:             ctx,
 		cancel:          cancel,
-	}, nil
+	}
+
+	// Set healthy status
+	atomic.StoreInt64(&worker.isHealthy, 1)
+
+	// Start health monitoring
+	worker.startHealthMonitoring()
+
+	return worker, nil
+}
+
+func (w *NATSWorker) startHealthMonitoring() {
+	w.healthTicker = time.NewTicker(30 * time.Second)
+	go func() {
+		defer w.healthTicker.Stop()
+		for {
+			select {
+			case <-w.ctx.Done():
+				return
+			case <-w.healthTicker.C:
+				w.performHealthCheck()
+			}
+		}
+	}()
+}
+
+// ENHANCED: Better health monitoring with upload tracking
+func (w *NATSWorker) performHealthCheck() {
+	if w.nc == nil || w.nc.IsClosed() {
+		atomic.StoreInt64(&w.isHealthy, 0)
+		log.Printf("[WORKER] Health check failed: connection closed")
+		return
+	}
+
+	// Check if connection is responsive
+	err := w.nc.Flush()
+	if err != nil {
+		atomic.StoreInt64(&w.isHealthy, 0)
+		log.Printf("[WORKER] Health check failed: %v", err)
+		return
+	}
+
+	atomic.StoreInt64(&w.isHealthy, 1)
+
+	// Clean up expired processing jobs with detailed logging
+	cutoff := time.Now().Add(-15 * time.Minute) // Increased from 10 minutes
+	cleanedCount := 0
+	stuckJobs := []string{}
+
+	w.processingJobs.Range(func(key, value interface{}) bool {
+		if job, ok := value.(ProcessingJob); ok {
+			if job.StartTime.Before(cutoff) {
+				w.processingJobs.Delete(key)
+				cleanedCount++
+				if job.LogID != "" {
+					stuckJobs = append(stuckJobs, job.LogID)
+				}
+			}
+		}
+		return true
+	})
+
+	if cleanedCount > 0 {
+		log.Printf("[WORKER] Cleanup: Removed %d stuck processing jobs (stuck > 15min)", cleanedCount)
+		for _, logID := range stuckJobs {
+			log.Printf("[WORKER] Cleaned stuck job log ID: %s", logID)
+		}
+	}
+
+	// Log current processing job count
+	activeJobs := 0
+	w.processingJobs.Range(func(key, value interface{}) bool {
+		activeJobs++
+		return true
+	})
+
+	if activeJobs > 0 {
+		log.Printf("[WORKER] Active jobs: %d currently processing", activeJobs)
+	}
 }
 
 func (w *NATSWorker) Start() error {
 	log.Println("[WORKER] Starting NATS worker")
 
+	// OPTIMIZED CONSUMER CONFIGURATION FOR BETTER THROUGHPUT
 	consumers := map[string]ConsumerConfig{
 		"generate-report": {
 			Subject:     SubjectGenerateReport,
 			Handler:     w.handleGenerateReport,
-			Concurrency: 3,
-			BatchSize:   2,
-			AckWait:     180 * time.Second,
-			MaxDeliver:  5,
+			Concurrency: 1,                 // Single worker to prevent race conditions
+			BatchSize:   1,                 // Process one at a time
+			AckWait:     300 * time.Second, // Longer timeout for export
+			MaxDeliver:  2,                 // Reduced max deliver
 		},
 		"upload-sftp": {
 			Subject:     SubjectUploadSFTP,
 			Handler:     w.handleUploadSFTP,
-			Concurrency: 50,
-			BatchSize:   20,
-			AckWait:     120 * time.Second,
-			MaxDeliver:  3,
+			Concurrency: 50,               // HIGH CONCURRENCY for uploads
+			BatchSize:   10,               // Larger batch for efficiency
+			AckWait:     60 * time.Second, // Shorter timeout for uploads
+			MaxDeliver:  2,                // Quick failure for problematic uploads
 		},
 		"late-data-check": {
 			Subject:     SubjectLateDataCheck,
 			Handler:     w.handleLateDataCheck,
-			Concurrency: 2,
+			Concurrency: 1, // Single worker
 			BatchSize:   1,
-			AckWait:     180 * time.Second,
-			MaxDeliver:  4,
+			AckWait:     300 * time.Second,
+			MaxDeliver:  2,
 		},
 	}
 
@@ -133,18 +247,16 @@ func (w *NATSWorker) Start() error {
 	return nil
 }
 
+// OPTIMIZED CONSUMER CONFIG
 func (w *NATSWorker) startConsumer(name string, config ConsumerConfig) error {
 	consumerName := fmt.Sprintf("%s-consumer", name)
 	streamName := "JARVIST_SFTP_JOBS"
 
+	// OPTIMIZED BACKOFF VALUES
 	backoffValues := []time.Duration{
-		2 * time.Second,
-		10 * time.Second,
-		30 * time.Second,
-	}
-
-	if config.MaxDeliver <= len(backoffValues) {
-		config.MaxDeliver = len(backoffValues) + 1
+		2 * time.Second,  // Quick first retry
+		10 * time.Second, // Medium retry
+		30 * time.Second, // Longer retry
 	}
 
 	consumerCfg := &nats.ConsumerConfig{
@@ -157,8 +269,20 @@ func (w *NATSWorker) startConsumer(name string, config ConsumerConfig) error {
 		BackOff:       backoffValues,
 		ReplayPolicy:  nats.ReplayInstantPolicy,
 		DeliverPolicy: nats.DeliverAllPolicy,
-		MaxAckPending: 200,
-		MaxWaiting:    1000,
+
+		// OPTIMIZED FOR HIGH THROUGHPUT UPLOADS
+		MaxAckPending: func() int {
+			if name == "upload-sftp" {
+				return 200 // High pending for uploads
+			}
+			return 20 // Lower for other consumers
+		}(),
+		MaxWaiting: func() int {
+			if name == "upload-sftp" {
+				return 500 // High waiting for uploads
+			}
+			return 50 // Lower for other consumers
+		}(),
 	}
 
 	_, err := w.js.AddConsumer(streamName, consumerCfg)
@@ -187,7 +311,8 @@ func (w *NATSWorker) startConsumer(name string, config ConsumerConfig) error {
 		go w.processMessages(name, sub, config, workerID)
 	}
 
-	log.Printf("[WORKER] Consumer started: %s (workers: %d)", name, config.Concurrency)
+	log.Printf("[WORKER] Consumer started: %s (workers: %d, maxPending: %d)",
+		name, config.Concurrency, consumerCfg.MaxAckPending)
 	return nil
 }
 
@@ -199,49 +324,88 @@ func (w *NATSWorker) processMessages(consumerName string, sub *nats.Subscription
 		case <-w.ctx.Done():
 			return
 		default:
+			// Check if worker is healthy
+			if atomic.LoadInt64(&w.isHealthy) == 0 {
+				log.Printf("[WORKER] Worker %d unhealthy, waiting...", workerID)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
 			w.fetchAndProcessBatch(consumerName, sub, config, workerID)
 		}
 	}
 }
 
+// OPTIMIZED MESSAGE FETCHING WITH BETTER TIMEOUT HANDLING
 func (w *NATSWorker) fetchAndProcessBatch(consumerName string, sub *nats.Subscription, config ConsumerConfig, workerID int) {
-	msgs, err := sub.Fetch(config.BatchSize, nats.MaxWait(5*time.Second))
+	// Dynamic fetch timeout based on consumer type
+	fetchTimeout := 5 * time.Second
+	if consumerName == "upload-sftp" {
+		fetchTimeout = 2 * time.Second // Faster polling for uploads
+	}
+
+	msgs, err := sub.Fetch(config.BatchSize, nats.MaxWait(fetchTimeout))
 	if err != nil {
 		if strings.Contains(err.Error(), "timeout") ||
 			strings.Contains(err.Error(), "no messages") ||
 			strings.Contains(err.Error(), "context deadline exceeded") {
 			return
 		}
-		log.Printf("[WORKER] Failed to fetch messages: %v", err)
-		time.Sleep(time.Second)
+		log.Printf("[WORKER] Failed to fetch messages for %s: %v", consumerName, err)
+
+		// Backoff on error
+		time.Sleep(1 * time.Second)
 		return
 	}
 
+	// Process messages in batch for efficiency
 	for _, msg := range msgs {
 		w.processMessage(msg, config.Handler, consumerName, workerID, config.AckWait)
 	}
 }
 
+// ENHANCED: Better message processing with status tracking
 func (w *NATSWorker) processMessage(msg *nats.Msg, handler func(*nats.Msg), consumerName string, workerID int, ackWait time.Duration) {
+	if msg == nil {
+		return
+	}
+
+	messageID := fmt.Sprintf("%s-%d-%d", consumerName, workerID, time.Now().UnixNano())
+
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[WORKER] Message processing panicked in %s worker %d: %v", consumerName, workerID, r)
+			log.Printf("[WORKER] PANIC in %s worker %d (msg: %s): %v",
+				consumerName, workerID, messageID, r)
 			log.Printf("[WORKER] Stack trace: %s", debug.Stack())
 
+			// Set unhealthy status temporarily
+			atomic.StoreInt64(&w.isHealthy, 0)
+
 			if msg != nil {
-				log.Printf("[WORKER] Failed message subject: %s", msg.Subject)
-				log.Printf("[WORKER] Failed message data: %s", string(msg.Data))
 				msg.Nak()
 			}
+
+			// Recover health status after a delay
+			go func() {
+				time.Sleep(30 * time.Second)
+				atomic.StoreInt64(&w.isHealthy, 1)
+			}()
 		}
 	}()
 
+	processingTimeout := ackWait - 10*time.Second
+	if processingTimeout < 30*time.Second {
+		processingTimeout = 30 * time.Second
+	}
+
+	startTime := time.Now()
 	done := make(chan error, 1)
 
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("[WORKER] Handler panicked in %s worker %d: %v", consumerName, workerID, r)
+				log.Printf("[WORKER] HANDLER PANIC in %s worker %d (msg: %s): %v",
+					consumerName, workerID, messageID, r)
 				log.Printf("[WORKER] Handler stack trace: %s", debug.Stack())
 				done <- fmt.Errorf("panic: %v", r)
 			}
@@ -252,33 +416,32 @@ func (w *NATSWorker) processMessage(msg *nats.Msg, handler func(*nats.Msg), cons
 			return
 		}
 
-		if msg == nil {
-			done <- fmt.Errorf("message is nil")
-			return
-		}
-
 		handler(msg)
 		done <- nil
 	}()
 
 	select {
 	case err := <-done:
+		duration := time.Since(startTime)
+
 		if err != nil {
-			log.Printf("[WORKER] Message processing failed in %s worker %d: %v", consumerName, workerID, err)
-			if msg != nil {
-				msg.Nak()
-			}
+			log.Printf("[WORKER] MESSAGE FAILED in %s worker %d after %v (msg: %s): %v",
+				consumerName, workerID, duration, messageID, err)
+			msg.Nak()
 		} else {
-			if msg != nil {
-				msg.Ack()
+			// Only log successful uploads, not all messages
+			if consumerName == "upload-sftp" {
+				log.Printf("[WORKER] MESSAGE SUCCESS in %s worker %d after %v (msg: %s)",
+					consumerName, workerID, duration, messageID)
 			}
+			msg.Ack()
 		}
 
-	case <-time.After(ackWait):
-		log.Printf("[WORKER] Message processing timeout in %s worker %d", consumerName, workerID)
-		if msg != nil {
-			msg.Nak()
-		}
+	case <-time.After(processingTimeout):
+		duration := time.Since(startTime)
+		log.Printf("[WORKER] TIMEOUT in %s worker %d after %v (msg: %s, timeout: %v)",
+			consumerName, workerID, duration, messageID, processingTimeout)
+		msg.Nak()
 	}
 }
 
@@ -325,14 +488,12 @@ func (w *NATSWorker) processNATSMessage(msg *nats.Msg, processor func([]byte) er
 	var envelope map[string]interface{}
 	if err := json.Unmarshal(msg.Data, &envelope); err != nil {
 		log.Printf("[WORKER] Failed to unmarshal envelope for %s: %v", messageType, err)
-		log.Printf("[WORKER] Raw message data: %s", string(msg.Data))
 		return
 	}
 
 	payload, exists := envelope["payload"]
 	if !exists {
 		log.Printf("[WORKER] Missing payload in message for %s", messageType)
-		log.Printf("[WORKER] Envelope content: %+v", envelope)
 		return
 	}
 
@@ -375,6 +536,19 @@ func (w *NATSWorker) handleGenerateReportTask(data []byte) error {
 		return fmt.Errorf("date is zero")
 	}
 
+	// Create unique job key for deduplication
+	jobKey := fmt.Sprintf("generate:%s:%s:%s", job.TenantID, job.Date.Format("20060102"), job.JobType)
+
+	// Check if already processing
+	if _, exists := w.processingJobs.LoadOrStore(jobKey, ProcessingJob{
+		StartTime: time.Now(),
+		WorkerID:  0,
+	}); exists {
+		log.Printf("[WORKER] Generate report job already processing: %s", jobKey)
+		return nil // Don't error, just skip
+	}
+	defer w.processingJobs.Delete(jobKey)
+
 	jobType := strings.ToLower(strings.TrimSpace(job.JobType))
 	log.Printf("[WORKER] Processing generate report job: tenant=%s, date=%s, jobType=%s", job.TenantID, job.Date.Format("2006-01-02"), jobType)
 
@@ -414,6 +588,7 @@ func (w *NATSWorker) handleGenerateReportTask(data []byte) error {
 	}
 }
 
+// ENHANCED: Better duplicate prevention with database check
 func (w *NATSWorker) handleUploadSFTPTask(data []byte) error {
 	if data == nil {
 		return fmt.Errorf("data is nil")
@@ -428,7 +603,7 @@ func (w *NATSWorker) handleUploadSFTPTask(data []byte) error {
 		return fmt.Errorf("failed to unmarshal upload SFTP job: %w", err)
 	}
 
-	// SIMPLIFIED: Validate required fields including LogID
+	// ENHANCED: Validate required fields
 	if job.LogID == "" {
 		return fmt.Errorf("logID is empty")
 	}
@@ -445,9 +620,54 @@ func (w *NATSWorker) handleUploadSFTPTask(data []byte) error {
 		return fmt.Errorf("filePath is empty")
 	}
 
-	log.Printf("[WORKER] Processing upload job for %s (log ID: %s)", job.FileName, job.LogID)
+	// ENHANCED: Check if this job is already being processed with detailed logging
+	jobKey := fmt.Sprintf("upload:%s", job.LogID)
 
-	return w.sftpService.UploadFile(job)
+	// Check if already processing
+	if existingJob, exists := w.processingJobs.Load(jobKey); exists {
+		if processJob, ok := existingJob.(ProcessingJob); ok {
+			timeSinceStart := time.Since(processJob.StartTime)
+			log.Printf("[WORKER] DUPLICATE DETECTED: %s (log ID: %s) already processing for %v",
+				job.FileName, job.LogID, timeSinceStart)
+
+			// If processing for too long, allow retry
+			if timeSinceStart > 10*time.Minute {
+				log.Printf("[WORKER] STUCK JOB: %s processing for %v, allowing retry",
+					job.FileName, timeSinceStart)
+				w.processingJobs.Delete(jobKey)
+			} else {
+				log.Printf("[WORKER] SKIPPING DUPLICATE: %s (already processing)", job.FileName)
+				return nil // Don't error, just skip duplicate
+			}
+		}
+	}
+
+	// Mark as processing with enhanced logging
+	processingJob := ProcessingJob{
+		StartTime: time.Now(),
+		LogID:     job.LogID,
+	}
+
+	w.processingJobs.Store(jobKey, processingJob)
+	defer func() {
+		w.processingJobs.Delete(jobKey)
+		processingDuration := time.Since(processingJob.StartTime)
+		log.Printf("[WORKER] COMPLETED PROCESSING: %s in %v (log ID: %s)",
+			job.FileName, processingDuration, job.LogID)
+	}()
+
+	log.Printf("[WORKER] STARTING UPLOAD: %s (log ID: %s)", job.FileName, job.LogID)
+
+	// Execute upload with enhanced error handling
+	err := w.sftpService.UploadFile(job)
+	if err != nil {
+		log.Printf("[WORKER] UPLOAD FAILED: %s (log ID: %s) - %v",
+			job.FileName, job.LogID, err)
+		return err
+	}
+
+	log.Printf("[WORKER] UPLOAD SUCCESS: %s (log ID: %s)", job.FileName, job.LogID)
+	return nil
 }
 
 func (w *NATSWorker) handleLateDataCheckTask(data []byte) error {
@@ -476,6 +696,18 @@ func (w *NATSWorker) handleLateDataCheckTask(data []byte) error {
 		return fmt.Errorf("checkType is empty")
 	}
 
+	// Create unique job key for deduplication
+	jobKey := fmt.Sprintf("latedata:%s:%s:%s", job.TenantID, job.Date.Format("20060102"), job.CheckType)
+
+	if _, exists := w.processingJobs.LoadOrStore(jobKey, ProcessingJob{
+		StartTime: time.Now(),
+		WorkerID:  0,
+	}); exists {
+		log.Printf("[WORKER] Late data check job already processing: %s", jobKey)
+		return nil
+	}
+	defer w.processingJobs.Delete(jobKey)
+
 	trimmedCheckType := strings.TrimSpace(job.CheckType)
 	log.Printf("[WORKER] Processing late data check: tenant=%s, date=%s, checkType=%s",
 		job.TenantID, job.Date.Format("2006-01-02"), trimmedCheckType)
@@ -485,6 +717,11 @@ func (w *NATSWorker) handleLateDataCheckTask(data []byte) error {
 
 func (w *NATSWorker) Stop() error {
 	log.Println("[WORKER] Stopping NATS worker")
+
+	// Stop health monitoring
+	if w.healthTicker != nil {
+		w.healthTicker.Stop()
+	}
 
 	w.cancel()
 
@@ -506,8 +743,8 @@ func (w *NATSWorker) Stop() error {
 	select {
 	case <-done:
 		log.Println("[WORKER] All workers stopped")
-	case <-time.After(30 * time.Second):
-		log.Println("[WORKER] Timeout waiting for workers")
+	case <-time.After(45 * time.Second):
+		log.Println("[WORKER] Timeout waiting for workers to stop")
 	}
 
 	if w.nc != nil && w.nc.IsConnected() {

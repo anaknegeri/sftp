@@ -1,3 +1,4 @@
+// File: internal/service/sftp_service.go - COMPLETE FIX
 package service
 
 import (
@@ -8,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"jarvist/sftp-service/internal/config"
@@ -43,12 +45,15 @@ type SFTPConnectionPool struct {
 }
 
 type sftpService struct {
-	sftpLogRepo     repository.SFTPLogRepository
-	localPath       string
-	connectionPools map[string]*SFTPConnectionPool
-	poolMutex       sync.RWMutex
-	cleanupTicker   *time.Ticker
-	stopCleanup     chan struct{}
+	sftpLogRepo          repository.SFTPLogRepository
+	localPath            string
+	connectionPools      map[string]*SFTPConnectionPool
+	poolMutex            sync.RWMutex
+	cleanupTicker        *time.Ticker
+	stopCleanup          chan struct{}
+	uploadLocks          sync.Map // map[string]time.Time for logID -> start time
+	activeUploads        int64    // atomic counter
+	maxConcurrentUploads int64
 }
 
 type UploadResult struct {
@@ -60,24 +65,47 @@ type UploadResult struct {
 
 func NewSFTPService(sftpLogRepo repository.SFTPLogRepository, localPath string) SFTPService {
 	service := &sftpService{
-		sftpLogRepo:     sftpLogRepo,
-		localPath:       localPath,
-		connectionPools: make(map[string]*SFTPConnectionPool),
-		stopCleanup:     make(chan struct{}),
+		sftpLogRepo:          sftpLogRepo,
+		localPath:            localPath,
+		connectionPools:      make(map[string]*SFTPConnectionPool),
+		stopCleanup:          make(chan struct{}),
+		maxConcurrentUploads: 30, // Increased concurrent uploads
 	}
 
-	service.cleanupTicker = time.NewTicker(2 * time.Minute)
+	service.cleanupTicker = time.NewTicker(1 * time.Minute) // More frequent cleanup
 	go service.cleanupIdleConnections()
 
 	return service
 }
 
 func (s *sftpService) UploadFile(job types.UploadSFTPJob) error {
-	log.Printf("[SFTP] Starting upload for file %s (log ID: %s)", job.FileName, job.LogID)
+	// Check if already processing this exact job
+	if s.isUploadInProgress(job.LogID) {
+		log.Printf("[SFTP] Upload already in progress for log ID: %s", job.LogID)
+		return nil
+	}
+
+	// Wait for available upload slot
+	if !s.waitForUploadSlot(30 * time.Second) {
+		return fmt.Errorf("upload queue full, try again later")
+	}
+
+	// Increment active uploads
+	atomic.AddInt64(&s.activeUploads, 1)
+	defer atomic.AddInt64(&s.activeUploads, -1)
+
+	log.Printf("[SFTP] Starting upload for file %s (log ID: %s) [Active: %d]",
+		job.FileName, job.LogID, atomic.LoadInt64(&s.activeUploads))
+
+	// Mark as processing
+	s.uploadLocks.Store(job.LogID, time.Now())
+	defer s.uploadLocks.Delete(job.LogID)
 
 	_, exists := config.GetTenantByID(job.TenantID)
 	if !exists {
-		return fmt.Errorf("tenant %s not found or disabled", job.TenantID)
+		errorMsg := fmt.Sprintf("tenant %s not found or disabled", job.TenantID)
+		s.sftpLogRepo.UpdateStatus(job.LogID, "FAILED", &errorMsg)
+		return fmt.Errorf("%s", errorMsg)
 	}
 
 	result := s.uploadFileWithLogID(job)
@@ -87,8 +115,179 @@ func (s *sftpService) UploadFile(job types.UploadSFTPJob) error {
 		return result.Error
 	}
 
-	log.Printf("[SFTP] Upload successful for file %s", job.FileName)
+	log.Printf("[SFTP] Upload successful for file %s [Active: %d]",
+		job.FileName, atomic.LoadInt64(&s.activeUploads))
 	return nil
+}
+
+func (s *sftpService) waitForUploadSlot(timeout time.Duration) bool {
+	start := time.Now()
+	for {
+		if atomic.LoadInt64(&s.activeUploads) < s.maxConcurrentUploads {
+			return true
+		}
+
+		if time.Since(start) > timeout {
+			log.Printf("[SFTP] Upload slot wait timeout after %v", timeout)
+			return false
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// ENHANCED: Better duplicate detection with database check
+func (s *sftpService) isUploadInProgress(logID string) bool {
+	// Check in-memory lock first
+	if startTime, exists := s.uploadLocks.Load(logID); exists {
+		if time.Since(startTime.(time.Time)) < 5*time.Minute {
+			log.Printf("[SFTP] Upload already in progress (memory lock): %s", logID)
+			return true
+		}
+		// Clean up expired lock
+		s.uploadLocks.Delete(logID)
+	}
+
+	// Check database status
+	if existingLog, err := s.sftpLogRepo.GetByID(logID); err == nil && existingLog != nil {
+		switch existingLog.Status {
+		case "SUCCESS":
+			log.Printf("[SFTP] Upload already completed (SUCCESS): %s", logID)
+			return true
+		case "PROCESSING":
+			// Check if processing for too long (stuck)
+			if time.Since(existingLog.TransferStartTime) > 10*time.Minute {
+				log.Printf("[SFTP] Processing stuck for %v, allowing retry: %s",
+					time.Since(existingLog.TransferStartTime), logID)
+				// Reset to PENDING to allow retry
+				s.sftpLogRepo.UpdateStatus(logID, "PENDING", nil)
+				return false
+			}
+			log.Printf("[SFTP] Upload currently processing: %s", logID)
+			return true
+		}
+	}
+
+	return false
+}
+
+func (s *sftpService) uploadFileWithLogID(job types.UploadSFTPJob) UploadResult {
+	maxRetries := 2
+	var uploadErr error
+
+	// START: Verify log entry exists before processing
+	existingLog, err := s.sftpLogRepo.GetByID(job.LogID)
+	if err != nil {
+		log.Printf("[SFTP] ERROR: Failed to get log entry %s: %v", job.LogID, err)
+		return UploadResult{LogID: job.LogID, FileName: job.FileName, Success: false, Error: fmt.Errorf("log entry not found: %w", err)}
+	}
+
+	if existingLog == nil {
+		log.Printf("[SFTP] ERROR: Log entry %s does not exist", job.LogID)
+		return UploadResult{LogID: job.LogID, FileName: job.FileName, Success: false, Error: fmt.Errorf("log entry not found")}
+	}
+
+	// Check if already SUCCESS
+	if existingLog.Status == "SUCCESS" {
+		log.Printf("[SFTP] ✅ ALREADY SUCCESS: %s (log ID: %s)", job.FileName, job.LogID)
+		return UploadResult{LogID: job.LogID, FileName: job.FileName, Success: true, Error: nil}
+	}
+
+	// Update to PROCESSING status to prevent duplicates
+	if existingLog.Status != "PROCESSING" {
+		processingMsg := "Upload in progress"
+		if updateErr := s.sftpLogRepo.UpdateStatus(job.LogID, "PROCESSING", &processingMsg); updateErr != nil {
+			log.Printf("[SFTP] WARN: Failed to update PROCESSING status for %s: %v", job.FileName, updateErr)
+		} else {
+			log.Printf("[SFTP] 🔄 PROCESSING: %s (log ID: %s)", job.FileName, job.LogID)
+		}
+	}
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		log.Printf("[SFTP] Upload attempt %d/%d for %s (log ID: %s)",
+			attempt, maxRetries, job.FileName, job.LogID)
+
+		uploadErr = s.performUpload(job)
+		if uploadErr == nil {
+			// SUCCESS - update status with detailed logging
+			log.Printf("[SFTP] Upload completed successfully, updating database status for %s", job.FileName)
+
+			if updateErr := s.updateStatusWithRetry(job.LogID, "SUCCESS", nil, 3); updateErr != nil {
+				log.Printf("[SFTP] ERROR: Failed to update SUCCESS status for %s after %d retries: %v",
+					job.FileName, 3, updateErr)
+				// Don't fail the upload, just log the error
+			} else {
+				log.Printf("[SFTP] ✅ SUCCESS: %s (log ID: %s) - Database updated", job.FileName, job.LogID)
+			}
+
+			log.Printf("[SFTP] Upload successful for file %s", job.FileName)
+			return UploadResult{LogID: job.LogID, FileName: job.FileName, Success: true, Error: nil}
+		}
+
+		errorCategory := utils.GetErrorCategory(uploadErr)
+		log.Printf("[SFTP] ❌ Attempt %d failed for %s [%s]: %v",
+			attempt, job.FileName, errorCategory, uploadErr)
+
+		if attempt < maxRetries && s.shouldRetry(uploadErr) {
+			delay := s.getRetryDelay(attempt, uploadErr)
+			log.Printf("[SFTP] Retrying %s in %v...", job.FileName, delay)
+			time.Sleep(delay)
+		}
+	}
+
+	// FAILED after all retries - update status with detailed logging
+	log.Printf("[SFTP] Upload failed after %d attempts, updating database status for %s", maxRetries, job.FileName)
+
+	errorMsg := uploadErr.Error()
+	if updateErr := s.updateStatusWithRetry(job.LogID, "FAILED", &errorMsg, 3); updateErr != nil {
+		log.Printf("[SFTP] ERROR: Failed to update FAILED status for %s after %d retries: %v",
+			job.FileName, 3, updateErr)
+	} else {
+		log.Printf("[SFTP] ❌ FINAL FAILURE: %s - %v (log ID: %s) - Database updated",
+			job.FileName, uploadErr, job.LogID)
+	}
+
+	return UploadResult{LogID: job.LogID, FileName: job.FileName, Success: false, Error: uploadErr}
+}
+
+// NEW: Retry mechanism for database updates
+func (s *sftpService) updateStatusWithRetry(logID, status string, errorMessage *string, maxRetries int) error {
+	var updateErr error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		updateErr = s.sftpLogRepo.UpdateStatus(logID, status, errorMessage)
+		if updateErr == nil {
+			if attempt > 1 {
+				log.Printf("[SFTP] Database update succeeded on attempt %d for log ID: %s", attempt, logID)
+			}
+			return nil
+		}
+
+		log.Printf("[SFTP] Database update attempt %d/%d failed for log ID %s: %v",
+			attempt, maxRetries, logID, updateErr)
+
+		if attempt < maxRetries {
+			// Exponential backoff
+			delay := time.Duration(attempt) * 500 * time.Millisecond
+			time.Sleep(delay)
+		}
+	}
+
+	return fmt.Errorf("failed after %d attempts: %w", maxRetries, updateErr)
+}
+
+func (s *sftpService) shouldRetry(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Don't retry authentication errors
+	if utils.IsAuthenticationError(err) {
+		return false
+	}
+
+	// Retry connection and temporary errors
+	return utils.IsConnectionError(err) || utils.IsTemporaryError(err)
 }
 
 func (s *sftpService) UploadAllPendingFiles(tenantID string) error {
@@ -107,40 +306,55 @@ func (s *sftpService) UploadAllPendingFiles(tenantID string) error {
 		return nil
 	}
 
-	// Convert logs to jobs
-	validJobs := []types.UploadSFTPJob{}
-	missingFiles := 0
-
-	for _, logEntry := range pendingLogs {
-		if _, err := os.Stat(logEntry.FilePath); os.IsNotExist(err) {
-			log.Printf("[SFTP] File missing: %s", logEntry.FilePath)
-			errorMsg := fmt.Sprintf("File not found: %s", logEntry.FilePath)
-			s.sftpLogRepo.UpdateStatus(logEntry.ID, "FAILED", &errorMsg)
-			missingFiles++
-			continue
+	// Process in smaller batches to avoid overwhelming
+	batchSize := 50
+	for i := 0; i < len(pendingLogs); i += batchSize {
+		end := i + batchSize
+		if end > len(pendingLogs) {
+			end = len(pendingLogs)
 		}
 
-		validJobs = append(validJobs, types.UploadSFTPJob{
-			LogID:      logEntry.ID,
-			TenantID:   logEntry.TenantID,
-			FilePath:   logEntry.FilePath,
-			FileName:   logEntry.FileName,
-			RemotePath: logEntry.RemotePath,
-			FileType:   logEntry.FileType,
-			LocationID: logEntry.LocationID,
-			CreatedAt:  time.Now(),
-		})
+		batchLogs := pendingLogs[i:end]
+		validJobs := []types.UploadSFTPJob{}
+		missingFiles := 0
+
+		for _, logEntry := range batchLogs {
+			if _, err := os.Stat(logEntry.FilePath); os.IsNotExist(err) {
+				log.Printf("[SFTP] File missing: %s", logEntry.FilePath)
+				errorMsg := fmt.Sprintf("File not found: %s", logEntry.FilePath)
+				s.sftpLogRepo.UpdateStatus(logEntry.ID, "FAILED", &errorMsg)
+				missingFiles++
+				continue
+			}
+
+			validJobs = append(validJobs, types.UploadSFTPJob{
+				LogID:      logEntry.ID,
+				TenantID:   logEntry.TenantID,
+				FilePath:   logEntry.FilePath,
+				FileName:   logEntry.FileName,
+				RemotePath: logEntry.RemotePath,
+				FileType:   logEntry.FileType,
+				LocationID: logEntry.LocationID,
+				CreatedAt:  time.Now(),
+			})
+		}
+
+		log.Printf("[SFTP] Batch %d-%d: %d valid, %d missing files",
+			i+1, end, len(validJobs), missingFiles)
+
+		if len(validJobs) > 0 {
+			if err := s.UploadFilesBatch(validJobs); err != nil {
+				log.Printf("[SFTP] Batch %d-%d failed: %v", i+1, end, err)
+			}
+		}
+
+		// Small delay between batches
+		if end < len(pendingLogs) {
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
 
-	log.Printf("[SFTP] File validation: %d valid, %d missing", len(validJobs), missingFiles)
-
-	if len(validJobs) == 0 {
-		log.Printf("[SFTP] No valid files to upload for tenant %s", tenantID)
-		return nil
-	}
-
-	log.Printf("[SFTP] Starting batch upload for %d valid files", len(validJobs))
-	return s.UploadFilesBatch(validJobs)
+	return nil
 }
 
 func (s *sftpService) UploadFilesBatch(jobs []types.UploadSFTPJob) error {
@@ -150,7 +364,8 @@ func (s *sftpService) UploadFilesBatch(jobs []types.UploadSFTPJob) error {
 
 	log.Printf("[SFTP] Starting batch upload for %d files", len(jobs))
 
-	const maxConcurrency = 8
+	// Increased concurrency but with better control
+	maxConcurrency := 15
 	semaphore := make(chan struct{}, maxConcurrency)
 	var wg sync.WaitGroup
 
@@ -158,59 +373,35 @@ func (s *sftpService) UploadFilesBatch(jobs []types.UploadSFTPJob) error {
 	var successCount, failureCount int32
 	startTime := time.Now()
 
-	batchSize := 15
-	for i := 0; i < len(jobs); i += batchSize {
-		end := i + batchSize
-		if end > len(jobs) {
-			end = len(jobs)
-		}
+	// Process jobs with controlled concurrency
+	for _, job := range jobs {
+		wg.Add(1)
+		go func(job types.UploadSFTPJob) {
+			defer wg.Done()
 
-		currentBatch := jobs[i:end]
-		log.Printf("[SFTP] Processing batch %d-%d of %d files", i+1, end, len(jobs))
-
-		batchWg := sync.WaitGroup{}
-		for _, job := range currentBatch {
-			batchWg.Add(1)
-			wg.Add(1)
-			go func(job types.UploadSFTPJob) {
-				defer wg.Done()
-				defer batchWg.Done()
-
-				select {
-				case semaphore <- struct{}{}:
-					defer func() { <-semaphore }()
-				case <-time.After(60 * time.Second):
-					log.Printf("[SFTP] Semaphore timeout for %s", job.FileName)
-					resultChan <- UploadResult{
-						LogID:    job.LogID,
-						FileName: job.FileName,
-						Success:  false,
-						Error:    fmt.Errorf("timeout acquiring semaphore"),
-					}
-					return
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-time.After(30 * time.Second):
+				log.Printf("[SFTP] Semaphore timeout for %s", job.FileName)
+				resultChan <- UploadResult{
+					LogID:    job.LogID,
+					FileName: job.FileName,
+					Success:  false,
+					Error:    fmt.Errorf("timeout acquiring semaphore"),
 				}
+				return
+			}
 
-				result := s.uploadFileWithLogID(job)
-				resultChan <- result
+			result := s.uploadFileWithLogID(job)
+			resultChan <- result
 
-				if result.Success {
-					successCount++
-				} else {
-					failureCount++
-				}
-			}(job)
-		}
-
-		batchWg.Wait()
-
-		elapsed := time.Since(startTime)
-		rate := float64(end) / elapsed.Seconds()
-		log.Printf("[SFTP] Batch %d-%d completed. Success: %d, Failed: %d, Rate: %.1f files/sec",
-			i+1, end, successCount, failureCount, rate)
-
-		if end < len(jobs) {
-			time.Sleep(1 * time.Second)
-		}
+			if result.Success {
+				atomic.AddInt32(&successCount, 1)
+			} else {
+				atomic.AddInt32(&failureCount, 1)
+			}
+		}(job)
 	}
 
 	go func() {
@@ -231,9 +422,15 @@ func (s *sftpService) UploadFilesBatch(jobs []types.UploadSFTPJob) error {
 	log.Printf("[SFTP] Batch upload completed in %v: %d success, %d failed (%.1f files/sec)",
 		elapsed, successCount, failureCount, rate)
 
-	if len(errors) > 0 && len(errors) <= 5 {
+	// Log only first 3 errors to avoid spam
+	if len(errors) > 0 && len(errors) <= 3 {
 		for _, err := range errors {
 			log.Printf("[SFTP] Upload error: %v", err)
+		}
+	} else if len(errors) > 3 {
+		log.Printf("[SFTP] %d upload errors (showing first 3):", len(errors))
+		for i := 0; i < 3; i++ {
+			log.Printf("[SFTP] Upload error: %v", errors[i])
 		}
 	}
 
@@ -242,47 +439,6 @@ func (s *sftpService) UploadFilesBatch(jobs []types.UploadSFTPJob) error {
 	}
 
 	return nil
-}
-
-func (s *sftpService) uploadFileWithLogID(job types.UploadSFTPJob) UploadResult {
-	maxRetries := 2
-	var uploadErr error
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		log.Printf("[SFTP] Upload attempt %d/%d for %s (log ID: %s)",
-			attempt, maxRetries, job.FileName, job.LogID)
-
-		uploadErr = s.performUpload(job)
-		if uploadErr == nil {
-			// SUCCESS - update status using LogID
-			if updateErr := s.sftpLogRepo.UpdateStatus(job.LogID, "SUCCESS", nil); updateErr != nil {
-				log.Printf("[SFTP] WARN: Failed to update SUCCESS status for %s: %v", job.FileName, updateErr)
-			} else {
-				log.Printf("[SFTP] ✅ SUCCESS: %s (log ID: %s)", job.FileName, job.LogID)
-			}
-			return UploadResult{LogID: job.LogID, FileName: job.FileName, Success: true, Error: nil}
-		}
-
-		errorCategory := utils.GetErrorCategory(uploadErr)
-		log.Printf("[SFTP] ❌ Attempt %d failed for %s [%s]: %v",
-			attempt, job.FileName, errorCategory, uploadErr)
-
-		if attempt < maxRetries {
-			delay := s.getRetryDelay(attempt, uploadErr)
-			log.Printf("[SFTP] Retrying %s in %v...", job.FileName, delay)
-			time.Sleep(delay)
-		}
-	}
-
-	// FAILED after all retries - update status using LogID
-	errorMsg := uploadErr.Error()
-	if updateErr := s.sftpLogRepo.UpdateStatus(job.LogID, "FAILED", &errorMsg); updateErr != nil {
-		log.Printf("[SFTP] WARN: Failed to update FAILED status for %s: %v", job.FileName, updateErr)
-	} else {
-		log.Printf("[SFTP] ❌ FINAL FAILURE: %s - %v (log ID: %s)", job.FileName, uploadErr, job.LogID)
-	}
-
-	return UploadResult{LogID: job.LogID, FileName: job.FileName, Success: false, Error: uploadErr}
 }
 
 func (s *sftpService) performUpload(job types.UploadSFTPJob) error {
@@ -299,13 +455,13 @@ func (s *sftpService) performUpload(job types.UploadSFTPJob) error {
 }
 
 func (s *sftpService) getRetryDelay(attempt int, err error) time.Duration {
-	baseDelay := time.Duration(attempt) * 2 * time.Second
+	baseDelay := time.Duration(attempt) * time.Second
 
 	if utils.IsConnectionError(err) {
 		return baseDelay * 2
 	}
 	if utils.IsTemporaryError(err) {
-		return baseDelay / 2
+		return baseDelay
 	}
 
 	return baseDelay
@@ -347,16 +503,32 @@ func (s *sftpService) cleanupIdleConnections() {
 }
 
 func (s *sftpService) performCleanup() {
+	// Clean up expired upload locks
+	expiredCount := 0
+	cutoff := time.Now().Add(-5 * time.Minute)
+
+	s.uploadLocks.Range(func(key, value interface{}) bool {
+		if startTime, ok := value.(time.Time); ok && startTime.Before(cutoff) {
+			s.uploadLocks.Delete(key)
+			expiredCount++
+		}
+		return true
+	})
+
+	if expiredCount > 0 {
+		log.Printf("[SFTP] Cleaned up %d expired upload locks", expiredCount)
+	}
+
+	// Clean up idle connections
 	s.poolMutex.RLock()
 	defer s.poolMutex.RUnlock()
 
-	for tenantID, pool := range s.connectionPools {
+	for _, pool := range s.connectionPools {
 		pool.mu.Lock()
 		for connKey, conn := range pool.connections {
 			conn.mu.RLock()
 			if time.Since(conn.lastUsed) > pool.maxIdle || time.Since(conn.lastUsed) > pool.maxLifetime {
 				conn.mu.RUnlock()
-				log.Printf("[SFTP] Cleaning up idle connection for tenant %s", tenantID)
 				s.closeConnection(conn)
 				delete(pool.connections, connKey)
 			} else {
@@ -380,8 +552,8 @@ func (s *sftpService) getOrCreatePool(tenantID string) *SFTPConnectionPool {
 		if !exists {
 			pool = &SFTPConnectionPool{
 				connections: make(map[string]*SFTPConnection),
-				maxIdle:     10 * time.Minute,
-				maxLifetime: 60 * time.Minute,
+				maxIdle:     5 * time.Minute,
+				maxLifetime: 30 * time.Minute,
 			}
 			s.connectionPools[tenantID] = pool
 		}
@@ -427,7 +599,7 @@ func (s *sftpService) isConnectionHealthy(conn *SFTPConnection) bool {
 		return false
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
 	done := make(chan bool, 1)
@@ -449,13 +621,11 @@ func (s *sftpService) isConnectionHealthy(conn *SFTPConnection) bool {
 }
 
 func (s *sftpService) createNewConnection(pool *SFTPConnectionPool, connKey string, tenantConfig *config.TenantConfig) (*SFTPConnection, error) {
-	log.Printf("[SFTP] Creating new connection for tenant %s", tenantConfig.ID)
-
 	sshConfig := &ssh.ClientConfig{
 		User:            tenantConfig.SFTP.User,
 		Auth:            []ssh.AuthMethod{},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         15 * time.Second,
+		Timeout:         10 * time.Second,
 	}
 
 	if tenantConfig.SFTP.Password != "" {
@@ -478,7 +648,7 @@ func (s *sftpService) createNewConnection(pool *SFTPConnectionPool, connKey stri
 
 	var sshClient *ssh.Client
 	var err error
-	maxRetries := 3
+	maxRetries := 2
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		addr := fmt.Sprintf("%s:%s", tenantConfig.SFTP.Host, tenantConfig.SFTP.Port)
@@ -487,9 +657,8 @@ func (s *sftpService) createNewConnection(pool *SFTPConnectionPool, connKey stri
 			break
 		}
 
-		log.Printf("[SFTP] SSH connection attempt %d/%d failed: %v", attempt, maxRetries, err)
 		if attempt < maxRetries {
-			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			time.Sleep(time.Duration(attempt) * time.Second)
 		}
 	}
 
@@ -515,7 +684,6 @@ func (s *sftpService) createNewConnection(pool *SFTPConnectionPool, connKey stri
 	pool.connections[connKey] = conn
 	pool.mu.Unlock()
 
-	log.Printf("[SFTP] New connection created for tenant %s", tenantConfig.ID)
 	return conn, nil
 }
 
@@ -540,8 +708,6 @@ func (s *sftpService) closeConnection(conn *SFTPConnection) {
 func (s *sftpService) performUploadWithConnection(tenantConfig *config.TenantConfig, localPath, remotePath string) error {
 	remotePath = strings.ReplaceAll(remotePath, "\\", "/")
 
-	log.Printf("[SFTP] Uploading %s to %s", localPath, remotePath)
-
 	conn, err := s.getConnection(tenantConfig)
 	if err != nil {
 		return fmt.Errorf("failed to get SFTP connection: %w", err)
@@ -555,16 +721,11 @@ func (s *sftpService) performUploadWithConnection(tenantConfig *config.TenantCon
 
 	remoteFile, err := conn.sftpClient.OpenFile(remotePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
-		log.Printf("[SFTP] OpenFile with TRUNC failed: %v, trying without TRUNC", err)
 		remoteFile, err = conn.sftpClient.OpenFile(remotePath, os.O_WRONLY|os.O_CREATE)
 		if err != nil {
 			conn.mu.Lock()
 			conn.isHealthy = false
 			conn.mu.Unlock()
-
-			if utils.IsConnectionError(err) {
-				return fmt.Errorf("connection error while creating file %s: %w", remotePath, err)
-			}
 			return fmt.Errorf("failed to create remote file %s: %w", remotePath, err)
 		}
 
@@ -578,7 +739,7 @@ func (s *sftpService) performUploadWithConnection(tenantConfig *config.TenantCon
 	}
 	defer remoteFile.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	err = s.copyFileWithTimeout(ctx, remoteFile, localFile)
@@ -589,14 +750,12 @@ func (s *sftpService) performUploadWithConnection(tenantConfig *config.TenantCon
 		return fmt.Errorf("failed to upload file: %w", err)
 	}
 
-	log.Printf("[SFTP] File uploaded successfully: %s -> %s", localPath, remotePath)
 	return nil
 }
 
 func (s *sftpService) copyFileWithTimeout(ctx context.Context, dst io.Writer, src io.Reader) error {
-	buffer := make([]byte, 256*1024)
+	buffer := make([]byte, 128*1024)
 	totalBytes := int64(0)
-	lastProgressTime := time.Now()
 
 	done := make(chan error, 1)
 
@@ -607,10 +766,6 @@ func (s *sftpService) copyFileWithTimeout(ctx context.Context, dst io.Writer, sr
 				done <- ctx.Err()
 				return
 			default:
-				if conn, ok := src.(*os.File); ok {
-					conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-				}
-
 				n, err := src.Read(buffer)
 				if err != nil {
 					if err == io.EOF {
@@ -627,13 +782,7 @@ func (s *sftpService) copyFileWithTimeout(ctx context.Context, dst io.Writer, sr
 						done <- fmt.Errorf("write error: %w", writeErr)
 						return
 					}
-
 					totalBytes += int64(written)
-
-					if time.Since(lastProgressTime) > 30*time.Second {
-						log.Printf("[SFTP] Upload progress: %d bytes transferred", totalBytes)
-						lastProgressTime = time.Now()
-					}
 				}
 			}
 		}
@@ -641,14 +790,8 @@ func (s *sftpService) copyFileWithTimeout(ctx context.Context, dst io.Writer, sr
 
 	select {
 	case <-ctx.Done():
-		return fmt.Errorf("upload timeout after 10 minutes")
+		return fmt.Errorf("upload timeout after 5 minutes")
 	case err := <-done:
-		if err != nil {
-			return err
-		}
-		if totalBytes > 1024*1024 {
-			log.Printf("[SFTP] Upload completed successfully: %d bytes transferred", totalBytes)
-		}
-		return nil
+		return err
 	}
 }
