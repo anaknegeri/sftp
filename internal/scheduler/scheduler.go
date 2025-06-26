@@ -34,19 +34,19 @@ func NewScheduler(queue queue.JobQueue, sftpService service.SFTPService, localPa
 func (s *Scheduler) Start() error {
 	log.Println("[SCHEDULER] Starting scheduler...")
 
-	// Job untuk generate report 30 menit - jalan setiap menit 00 dan 30
 	_, err := s.cron.AddFunc("0 0,30 * * * *", s.schedule30MinReportJob)
 	if err != nil {
 		return err
 	}
+	log.Println("[SCHEDULER] 30min report job scheduled: every 30min with dynamic business hour check")
 
-	// Job untuk generate report harian - jalan setiap jam 1 malam
 	_, err = s.cron.AddFunc("0 0 1 * * *", s.scheduleDailyReportJob)
 	if err != nil {
 		return err
 	}
+	log.Println("[SCHEDULER] Daily report job scheduled: daily at 01:00")
 
-	// NEW: Late data check jobs
+	// Late data check jobs
 	lateDataConfig := config.GetLateDataScheduleConfig()
 	if lateDataConfig.EnableLateDataCheck {
 		// Realtime check - untuk data yang baru masuk (every X minutes)
@@ -76,6 +76,7 @@ func (s *Scheduler) Start() error {
 	if err != nil {
 		return err
 	}
+	log.Println("[SCHEDULER] Cleanup job scheduled: daily at 02:00")
 
 	s.cron.Start()
 	log.Println("[SCHEDULER] Scheduler started successfully")
@@ -89,10 +90,16 @@ func (s *Scheduler) Stop() {
 }
 
 func (s *Scheduler) schedule30MinReportJob() {
-	log.Println("[SCHEDULER] Scheduling 30-minute report generation jobs")
+	now := config.NowJakarta()
+
+	if !s.isWithinBusinessHours(now) {
+		log.Printf("[SCHEDULER] Skipping 30min report generation - outside business hours (%s)", now.Format("15:04"))
+		return
+	}
+
+	log.Printf("[SCHEDULER] Scheduling 30-minute report generation jobs at %s", now.Format("15:04"))
 
 	tenants := config.GetEnabledTenants()
-	now := config.NowJakarta()
 
 	for tenantID := range tenants {
 		job := types.GenerateReportJob{
@@ -108,12 +115,28 @@ func (s *Scheduler) schedule30MinReportJob() {
 	}
 }
 
+func (s *Scheduler) isWithinBusinessHours(currentTime time.Time) bool {
+	businessHours := config.BusinessHours(currentTime)
+
+	isWithin := (currentTime.Equal(businessHours.StartTime) || currentTime.After(businessHours.StartTime)) &&
+		(currentTime.Equal(businessHours.EndTime) || currentTime.Before(businessHours.EndTime))
+
+	if !isWithin {
+		log.Printf("[SCHEDULER] Current time %s is outside business hours (%s - %s)",
+			currentTime.Format("15:04:05"),
+			businessHours.StartTime.Format("15:04:05"),
+			businessHours.EndTime.Format("15:04:05"))
+	}
+
+	return isWithin
+}
+
 func (s *Scheduler) scheduleDailyReportJob() {
 	log.Println("[SCHEDULER] Scheduling daily report generation jobs")
 
 	tenants := config.GetEnabledTenants()
 	now := config.NowJakarta()
-	yesterday := now.AddDate(0, 0, -1) // Generate report untuk kemarin
+	yesterday := now.AddDate(0, 0, -1)
 
 	for tenantID := range tenants {
 		job := types.GenerateReportJob{
@@ -129,7 +152,6 @@ func (s *Scheduler) scheduleDailyReportJob() {
 	}
 }
 
-// NEW: Schedule realtime late data check
 func (s *Scheduler) scheduleRealtimeLateDataCheck() {
 	log.Println("[SCHEDULER] Scheduling realtime late data check jobs")
 
@@ -150,7 +172,6 @@ func (s *Scheduler) scheduleRealtimeLateDataCheck() {
 	}
 }
 
-// NEW: Schedule historical late data check
 func (s *Scheduler) scheduleHistoricalLateDataCheck() {
 	log.Println("[SCHEDULER] Scheduling historical late data check jobs")
 
@@ -159,7 +180,6 @@ func (s *Scheduler) scheduleHistoricalLateDataCheck() {
 
 	lateDataConfig := config.GetLateDataScheduleConfig()
 
-	// Check multiple days back for historical data
 	for i := 1; i <= lateDataConfig.HistoricalLookbackDays; i++ {
 		checkDate := now.AddDate(0, 0, -i)
 
@@ -182,7 +202,7 @@ func (s *Scheduler) scheduleCleanupJob() {
 	log.Println("[SCHEDULER] Starting cleanup of old files")
 
 	tenants := config.GetEnabledTenants()
-	maxAge := 7 * 24 * time.Hour // Keep files for 7 days
+	maxAge := 7 * 24 * time.Hour
 
 	for tenantID := range tenants {
 		tenantDir := filepath.Join(s.localPath, tenantID)

@@ -1,3 +1,4 @@
+// File: internal/service/export_service.go - FIXED VERSION
 package service
 
 import (
@@ -196,7 +197,7 @@ func (s *exportService) ExportAllReport(tenantID string, date time.Time) error {
 		return nil
 	}
 
-	if err := s.generateCombinedReport(tenantID, date, allReports); err != nil {
+	if err := s.generateCombinedReport(tenantID, date, allReports, "daily_combined"); err != nil {
 		log.Printf("[EXPORT] Failed to generate combined report: %v", err)
 	} else {
 		log.Printf("[EXPORT] Combined report generated successfully")
@@ -219,6 +220,7 @@ func (s *exportService) ExportAllReport(tenantID string, date time.Time) error {
 	return nil
 }
 
+// FIXED: ExportDaily - Added combined report generation
 func (s *exportService) ExportDaily(tenantID string, date time.Time) error {
 	log.Printf("[DAILY] Starting export for tenant %s, date %s", tenantID, date.Format("2006-01-02"))
 
@@ -251,6 +253,7 @@ func (s *exportService) ExportDaily(tenantID string, date time.Time) error {
 	reportsByLocation := s.groupReportsByLocation(allReports)
 	successCount := 0
 
+	// Process individual location reports
 	for _, location := range locations {
 		if locationReports, exists := reportsByLocation[location.ID]; exists && len(locationReports) > 0 {
 			if err := s.processDailyReportWithData(tenantID, location, date, locationReports); err != nil {
@@ -259,6 +262,13 @@ func (s *exportService) ExportDaily(tenantID string, date time.Time) error {
 			}
 			successCount++
 		}
+	}
+
+	// Generate combined daily report
+	if err := s.generateCombinedReport(tenantID, date, allReports, "daily_combined"); err != nil {
+		log.Printf("[DAILY] Failed to generate combined daily report: %v", err)
+	} else {
+		log.Printf("[DAILY] Combined daily report generated successfully")
 	}
 
 	log.Printf("[DAILY] Export completed: %d/%d locations successful", successCount, len(locations))
@@ -318,8 +328,8 @@ func (s *exportService) Export30Min(tenantID string, triggerTime time.Time) erro
 		}
 	}
 
-	// 2. NEW: Generate combined file for all locations
-	if err := s.generateCombinedReport(tenantID, triggerTime, allReports); err != nil {
+	// 2. Generate combined file for all locations
+	if err := s.generateCombinedReport(tenantID, triggerTime, allReports, "30min_combined"); err != nil {
 		log.Printf("[30MIN] Failed to generate combined report: %v", err)
 	} else {
 		log.Printf("[30MIN] Combined report generated successfully")
@@ -918,7 +928,7 @@ func (s *exportService) filterCumulativeDataUpToWindow(allReports []entity.Daily
 	return cumulativeReports
 }
 
-func (s *exportService) generateCombinedReport(tenantID string, triggerTime time.Time, allReports []entity.DailyReport) error {
+func (s *exportService) generateCombinedReport(tenantID string, triggerTime time.Time, allReports []entity.DailyReport, fileType string) error {
 	jakartaTriggerTime := triggerTime.In(config.GetJakartaTimezone())
 
 	// Create a virtual location for combined report
@@ -932,7 +942,7 @@ func (s *exportService) generateCombinedReport(tenantID string, triggerTime time
 		TenantID:   tenantID,
 		LocationID: "ALL",
 		Date:       jakartaTriggerTime.Format("20060102"),
-		Type:       "30min_combined",
+		Type:       fileType,
 	}
 
 	if !s.acquireExportLock(exportKey) {

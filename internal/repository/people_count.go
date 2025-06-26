@@ -20,6 +20,7 @@ type PeopleCountRepository interface {
 	GetReportWithTimeRange(tenantID, locationID string, startTime, endTime time.Time) ([]entity.DailyReport, error)
 	GetAllReportsForTenant(tenantID string, date time.Time) ([]entity.DailyReport, error)
 	GetAllReportsForTenantWithTimeRange(tenantID string, startTime, endTime time.Time) ([]entity.DailyReport, error)
+	GetLateData(tenantID string, insertedSince time.Time, timestampBefore time.Time) ([]entity.DailyReport, error)
 }
 
 type peopleCountRepository struct {
@@ -284,4 +285,75 @@ func NewDailyTimeRange(date time.Time) TimeRange {
 	start := time.Date(jakartaDate.Year(), jakartaDate.Month(), jakartaDate.Day(), 0, 0, 0, 0, config.GetJakartaTimezone())
 	end := start.Add(24*time.Hour - time.Second)
 	return TimeRange{StartTime: start, EndTime: end}
+}
+
+func (r *peopleCountRepository) GetLateData(tenantID string, insertedSince time.Time, timestampBefore time.Time) ([]entity.DailyReport, error) {
+	var reports []entity.DailyReport
+
+	query := `
+		SELECT
+		  time_bucket,
+		  pc.tenant_id,
+		  pc.location_id,
+		  pc.location_code,
+		  pc.location_name,
+		  pc.device_id,
+		  pc.device_name,
+		  SUM(pc.count_in) AS total_in,
+		  SUM(pc.count_out) AS total_out
+		FROM (
+		  SELECT
+		    people_counts.*,
+		    locations.location_code,
+		    locations.name AS location_name,
+		    devices.device_name,
+		    date_trunc('hour', people_counts.timestamp) +
+		    INTERVAL '30 minutes' * FLOOR(EXTRACT(MINUTE FROM people_counts.timestamp) / 30) AS time_bucket
+		  FROM people_counts
+		  JOIN locations ON people_counts.location_id = locations.id
+		  JOIN devices ON people_counts.device_id = devices.id
+		  WHERE people_counts.tenant_id = ?
+		    AND people_counts.created_at > ?
+		    AND people_counts.timestamp < ?
+		    AND locations.status = 'active'
+		) pc
+		GROUP BY time_bucket, pc.tenant_id, pc.location_id, pc.location_code, pc.location_name, pc.device_id, pc.device_name
+		ORDER BY pc.location_code, time_bucket, pc.device_name
+	`
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	rows, err := r.db.WithContext(ctx).Raw(query, tenantID, insertedSince, timestampBefore).Rows()
+	if err != nil {
+		return nil, fmt.Errorf("failed to query late data: %w", err)
+	}
+	defer rows.Close()
+
+	recordCount := 0
+	for rows.Next() {
+		var report entity.DailyReport
+		var dateStr string
+
+		if err := rows.Scan(
+			&dateStr,
+			&report.TenantID,
+			&report.LocationID,
+			&report.LocationCode,
+			&report.LocationName,
+			&report.DeviceID,
+			&report.DeviceName,
+			&report.TotalIn,
+			&report.TotalOut,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan row: %w", err)
+		}
+
+		report.Date = dateStr
+		reports = append(reports, report)
+		recordCount++
+	}
+
+	log.Printf("[REPO] Found %d late data records for tenant %s", recordCount, tenantID)
+	return reports, nil
 }

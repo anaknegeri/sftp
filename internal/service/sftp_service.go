@@ -211,9 +211,6 @@ func (s *sftpService) uploadFileWithLogID(job types.UploadSFTPJob) UploadResult 
 
 		uploadErr = s.performUpload(job)
 		if uploadErr == nil {
-			// SUCCESS - update status with enhanced retry logic
-			log.Printf("[SFTP] Upload completed successfully, updating database status for %s", job.FileName)
-
 			// FIXED: Enhanced retry with different strategies
 			if updateErr := s.updateStatusWithRetry(job.LogID, "SUCCESS", nil, 5); updateErr != nil {
 				log.Printf("[SFTP] ERROR: Failed to update SUCCESS status for %s after 5 retries: %v",

@@ -59,12 +59,12 @@ type NATSConfig struct {
 }
 
 type LateDataScheduleConfig struct {
-	DailyCheckHours        []int
-	ThirtyMinCheckMinute   int
-	DailyCheckMinute       int
-	ThirtyMinLookBackHours int
-	HistoricalLookbackDays int
-	EnableLateDataCheck    bool
+	DailyCheckHours         []int
+	ThirtyMinCheckMinute    int
+	DailyCheckMinute        int
+	ThirtyMinLookBackMinute int
+	HistoricalLookbackDays  int
+	EnableLateDataCheck     bool
 }
 
 func Load() *Config {
@@ -122,12 +122,12 @@ func GetLateDataScheduleConfig() LateDataScheduleConfig {
 	}
 
 	return LateDataScheduleConfig{
-		DailyCheckHours:        defaultHours,
-		ThirtyMinCheckMinute:   getIntEnv("THIRTY_MIN_LATE_CHECK_MINUTE", 35),
-		DailyCheckMinute:       getIntEnv("DAILY_LATE_CHECK_MINUTE", 5),
-		ThirtyMinLookBackHours: getIntEnv("THIRTY_MIN_LOOKBACK_HOURS", 1),
-		HistoricalLookbackDays: getIntEnv("HISTORICAL_LOOKBACK_DAYS", 3),
-		EnableLateDataCheck:    getBoolEnv("ENABLE_LATE_DATA_CHECK", true),
+		DailyCheckHours:         defaultHours,
+		ThirtyMinCheckMinute:    getIntEnv("THIRTY_MIN_LATE_CHECK_MINUTE", 35),
+		DailyCheckMinute:        getIntEnv("DAILY_LATE_CHECK_MINUTE", 5),
+		ThirtyMinLookBackMinute: getIntEnv("THIRTY_MIN_LOOKBACK_MINUTE", 35),
+		HistoricalLookbackDays:  getIntEnv("HISTORICAL_LOOKBACK_DAYS", 3),
+		EnableLateDataCheck:     getBoolEnv("ENABLE_LATE_DATA_CHECK", true),
 	}
 }
 

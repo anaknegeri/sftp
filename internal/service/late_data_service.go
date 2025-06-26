@@ -48,9 +48,9 @@ func NewLateDataService(
 }
 
 func (s *lateDataService) CheckForLateData(tenantID string, checkDate time.Time, checkType string) error {
-	log.Printf("[LATE_DATA] Starting %s check for tenant %s, date %s", checkType, tenantID, checkDate.Format("2006-01-02"))
+	log.Printf("[LATE_DATA] Starting %s check for tenant %s", checkType, tenantID)
 
-	if err := s.validateCheckType(checkType); err != nil {
+	if err := s.validate(checkType); err != nil {
 		return err
 	}
 
@@ -60,468 +60,225 @@ func (s *lateDataService) CheckForLateData(tenantID string, checkDate time.Time,
 	}
 
 	if len(locations) == 0 {
-		log.Printf("[LATE_DATA] No locations found for tenant %s", tenantID)
 		return nil
 	}
 
-	allReports, err := s.fetchReportsForCheckType(tenantID, checkDate, checkType)
+	affectedLocations, err := s.detect(tenantID, checkDate, checkType)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to detect late data: %w", err)
 	}
 
-	if len(allReports) == 0 {
-		log.Printf("[LATE_DATA] No data found for tenant %s (%s check)", tenantID, checkType)
+	if len(affectedLocations) == 0 {
 		return nil
 	}
 
-	processedCount := s.processLocationsForLateData(tenantID, checkDate, checkType, locations, allReports)
-
-	log.Printf("[LATE_DATA] %s check completed: %d/%d locations processed", checkType, processedCount, len(locations))
-	return nil
-}
-
-func (s *lateDataService) fetchReportsForCheckType(tenantID string, checkDate time.Time, checkType string) ([]entity.DailyReport, error) {
-	switch strings.TrimSpace(checkType) {
-	case "realtime":
-		jakartaTime := checkDate.In(config.GetJakartaTimezone())
-		businessHoursRange := config.BusinessHours(jakartaTime)
-
-		oneHourAgo := jakartaTime.Add(-1 * time.Hour)
-		startTime := oneHourAgo
-		if oneHourAgo.Before(businessHoursRange.StartTime) {
-			startTime = businessHoursRange.StartTime
-		}
-
-		endTime := jakartaTime
-		if jakartaTime.After(businessHoursRange.EndTime) {
-			endTime = businessHoursRange.EndTime
-		}
-
-		return s.peopleRepo.GetAllReportsForTenantWithTimeRange(tenantID, startTime, endTime)
-	case "historical":
-		return s.peopleRepo.GetAllReportsForTenant(tenantID, checkDate)
-	default:
-		return nil, fmt.Errorf("unknown check type: %s", checkType)
-	}
-}
-
-func (s *lateDataService) processLocationsForLateData(tenantID string, checkDate time.Time, checkType string, locations []entity.Location, allReports []entity.DailyReport) int {
-	reportsByLocation := s.groupReportsByLocation(allReports)
 	processedCount := 0
-
 	for _, location := range locations {
-		locationReports, exists := reportsByLocation[location.ID]
-		if !exists || len(locationReports) == 0 {
+		if !s.contains(affectedLocations, location.ID) {
 			continue
 		}
 
-		hasLateData := s.checkHasLateData(location, checkDate, checkType, locationReports)
-		if !hasLateData {
-			continue
-		}
-
-		var err error
-		switch strings.TrimSpace(checkType) {
-		case "realtime":
-			err = s.regenerateRecentLateData(tenantID, location, checkDate, locationReports)
-		case "historical":
-			err = s.regenerateHistoricalLateData(tenantID, location, checkDate, locationReports)
-		}
-
-		if err != nil {
-			log.Printf("[LATE_DATA] Failed to regenerate data for location %s: %v", location.LocationCode, err)
+		if err := s.process(tenantID, location, checkDate, checkType); err != nil {
+			log.Printf("[LATE_DATA] Failed to process %s: %v", location.LocationCode, err)
 			continue
 		}
 		processedCount++
 	}
 
-	return processedCount
+	if processedCount > 0 {
+		if err := s.regenerateCombined(tenantID, checkDate); err != nil {
+			log.Printf("[LATE_DATA] Failed to regenerate combined: %v", err)
+		}
+	}
+
+	log.Printf("[LATE_DATA] Completed: %d/%d locations processed", processedCount, len(affectedLocations))
+	return nil
 }
 
-func (s *lateDataService) checkHasLateData(location entity.Location, checkDate time.Time, checkType string, reports []entity.DailyReport) bool {
+func (s *lateDataService) detect(tenantID string, checkDate time.Time, checkType string) ([]string, error) {
+	scheduleConfig := config.GetLateDataScheduleConfig()
+	jakartaTime := checkDate.In(config.GetJakartaTimezone())
+
+	var insertedSince, timestampBefore time.Time
+
 	switch strings.TrimSpace(checkType) {
 	case "realtime":
-		return s.hasRecentLateDataWithReports(location, checkDate, reports)
+		lookBack := time.Duration(scheduleConfig.ThirtyMinLookBackMinute) * time.Microsecond
+		insertedSince = jakartaTime.Add(-lookBack)
+		timestampBefore = jakartaTime.Add(-30 * time.Minute)
 	case "historical":
-		return s.hasHistoricalLateDataWithReports(location, checkDate, reports)
+		insertedSince = jakartaTime.Add(-24 * time.Hour)
+		businessHours := config.BusinessHours(jakartaTime)
+		timestampBefore = businessHours.EndTime
 	default:
-		return false
+		return nil, fmt.Errorf("unknown check type: %s", checkType)
+	}
+
+	reports, err := s.peopleRepo.GetLateData(tenantID, insertedSince, timestampBefore)
+	if err != nil {
+		return nil, err
+	}
+
+	locationSet := make(map[string]bool)
+	for _, report := range reports {
+		locationSet[report.LocationID] = true
+	}
+
+	var locations []string
+	for locationID := range locationSet {
+		locations = append(locations, locationID)
+	}
+
+	return locations, nil
+}
+
+func (s *lateDataService) process(tenantID string, location entity.Location, checkDate time.Time, checkType string) error {
+	switch strings.TrimSpace(checkType) {
+	case "realtime":
+		return s.processRealtime(tenantID, location, checkDate)
+	case "historical":
+		return s.processHistorical(tenantID, location, checkDate)
+	default:
+		return fmt.Errorf("unknown check type: %s", checkType)
 	}
 }
 
-func (s *lateDataService) regenerateRecentLateData(tenantID string, location entity.Location, checkDate time.Time, locationReports []entity.DailyReport) error {
-	if len(locationReports) == 0 || tenantID == "" || location.ID == "" {
-		return nil
-	}
-
+func (s *lateDataService) processRealtime(tenantID string, location entity.Location, checkDate time.Time) error {
 	jakartaTime := checkDate.In(config.GetJakartaTimezone())
-	isDifferentDay := s.isLateDataForDifferentDay(locationReports, jakartaTime)
+	businessHours := config.BusinessHours(jakartaTime)
 
-	if isDifferentDay {
-		log.Printf("[LATE_DATA] Cross-day late data for %s - regenerating daily reports only", location.LocationCode)
-		return s.regenerateCrossDayLateData(tenantID, location, locationReports)
-	}
-
-	log.Printf("[LATE_DATA] Same-day late data for %s - regenerating daily + windows", location.LocationCode)
-
-	businessHoursRange := config.BusinessHours(jakartaTime)
-	allDayReports, err := s.peopleRepo.GetReport(tenantID, location.ID, checkDate)
-	if err != nil {
-		return fmt.Errorf("failed to get all day reports: %w", err)
-	}
-
-	if len(allDayReports) == 0 {
-		return nil
-	}
-
-	existingWindowsMap, err := s.getExistingWindowsBatch(location, checkDate)
-	if err != nil {
-		log.Printf("[LATE_DATA] Warning: failed to get existing windows: %v", err)
-		existingWindowsMap = make(map[time.Time]*entity.SFTPTransferLog)
-	}
-
-	dailySuccess := s.regenerateDailyReportSafe(tenantID, location, businessHoursRange.StartTime, allDayReports)
-
-	allDataWindows := s.identifyExistingWindows(allDayReports)
-	var existingWindows []time.Time
-	for windowTime := range existingWindowsMap {
-		existingWindows = append(existingWindows, windowTime)
-	}
-
-	allWindowsToRegenerate := s.mergeAndSortWindows(existingWindows, allDataWindows)
-
-	windowsSuccess := s.regenerateWindowsBatch(tenantID, location, allWindowsToRegenerate, allDayReports, existingWindowsMap)
-
-	totalSuccess := 0
-	if dailySuccess {
-		totalSuccess++
-	}
-	totalSuccess += windowsSuccess
-
-	log.Printf("[LATE_DATA] Regeneration complete for %s: %d/%d operations successful",
-		location.LocationCode, totalSuccess, 1+len(allWindowsToRegenerate))
-
-	return nil
-}
-
-func (s *lateDataService) getExistingWindowsBatch(location entity.Location, date time.Time) (map[time.Time]*entity.SFTPTransferLog, error) {
-	jakartaDate := date.In(config.GetJakartaTimezone())
-	dateStr := jakartaDate.Format("20060102")
-
-	filePattern := fmt.Sprintf("%s_%s_", location.LocationCode, dateStr)
-
-	existingWindowsMap := make(map[time.Time]*entity.SFTPTransferLog)
-
-	since := 24 * time.Hour
-	allRecentLogs, err := s.sftpLogRepo.GetRecentByFileName(filePattern, since)
-	if err != nil {
-		return existingWindowsMap, err
-	}
-
-	for _, transferLog := range allRecentLogs {
-		if transferLog.TenantID == location.TenantID &&
-			transferLog.LocationID == &location.ID &&
-			strings.HasPrefix(transferLog.FileName, filePattern) &&
-			(transferLog.Status == "SUCCESS" || transferLog.Status == "PENDING") {
-
-			if windowTime := s.parseWindowTimeFromFileName(transferLog.FileName); !windowTime.IsZero() {
-				existingWindowsMap[windowTime] = transferLog
-			}
-		}
-	}
-
-	return existingWindowsMap, nil
-}
-
-func (s *lateDataService) parseWindowTimeFromFileName(fileName string) time.Time {
-
-	parts := strings.Split(fileName, "_")
-	if len(parts) < 3 {
-		return time.Time{}
-	}
-
-	dateStr := parts[1]                             // YYYYMMDD
-	timeStr := strings.TrimSuffix(parts[2], ".csv") // HHMM
-
-	if len(dateStr) != 8 || len(timeStr) != 4 {
-		return time.Time{}
-	}
-
-	fullTimeStr := dateStr + timeStr // YYYYMMDDHHMM
-	if windowTime, err := time.ParseInLocation("200601021504", fullTimeStr, config.GetJakartaTimezone()); err == nil {
-		return windowTime
-	}
-
-	return time.Time{}
-}
-
-func (s *lateDataService) regenerateWindowsBatch(tenantID string, location entity.Location, windows []time.Time, allDayReports []entity.DailyReport, existingWindowsMap map[time.Time]*entity.SFTPTransferLog) int {
-	if len(windows) == 0 {
-		return 0
-	}
-
-	successCount := 0
-	batchSize := 10
-
-	for i := 0; i < len(windows); i += batchSize {
-		end := i + batchSize
-		if end > len(windows) {
-			end = len(windows)
-		}
-
-		batchWindows := windows[i:end]
-		batchSuccess := 0
-
-		for _, windowTime := range batchWindows {
-			cumulativeReports := s.filterCumulativeDataUpToWindow(allDayReports, windowTime)
-			if len(cumulativeReports) == 0 {
-				continue
-			}
-
-			var existingLog *entity.SFTPTransferLog
-			if log, exists := existingWindowsMap[windowTime]; exists {
-				existingLog = log
-			}
-
-			if err := s.regenerate30MinWindow(tenantID, location, windowTime, cumulativeReports, existingLog); err == nil {
-				batchSuccess++
-			}
-		}
-
-		successCount += batchSuccess
-
-		if len(windows) > 20 && i+batchSize < len(windows) {
-			log.Printf("[LATE_DATA] Progress for %s: %d/%d windows processed",
-				location.LocationCode, end, len(windows))
-		}
-	}
-
-	return successCount
-}
-
-func (s *lateDataService) regenerate30MinWindow(tenantID string, location entity.Location, windowTime time.Time, allReports []entity.DailyReport, existingLog *entity.SFTPTransferLog) error {
-	if len(allReports) == 0 {
-		return nil
-	}
-
-	cumulativeReports := s.filterCumulativeDataUpToWindow(allReports, windowTime)
-	if len(cumulativeReports) == 0 {
-		return nil
-	}
-
-	filePath, err := s.csvWriter.Write30MinReport(tenantID, location.LocationCode, cumulativeReports, windowTime)
-	if err != nil {
-		return fmt.Errorf("failed to write 30min report: %w", err)
-	}
-
-	if existingLog != nil && existingLog.Status == "SUCCESS" {
-		if err := s.markFileAsReplaced(existingLog.ID); err == nil {
-			// Success - no need to query again
-		}
-	} else {
-		fileName := filepath.Base(filePath)
-		s.markPreviousFileAsReplaced(fileName)
-	}
-
-	return s.createLogAndUpload(tenantID, location.ID, filePath, entity.FileType30Min)
-}
-
-func (s *lateDataService) markFileAsReplaced(logID string) error {
-	replacedMsg := fmt.Sprintf("File replaced with updated data at %s", time.Now().Format("2006-01-02 15:04:05"))
-	return s.sftpLogRepo.UpdateStatus(logID, "REPLACED", &replacedMsg)
-}
-
-func (s *lateDataService) regenerateDailyReportSafe(tenantID string, location entity.Location, date time.Time, reports []entity.DailyReport) bool {
-	if err := s.regenerateDailyReport(tenantID, location, date, reports); err != nil {
-		return false
-	}
-	return true
-}
-
-func (s *lateDataService) isLateDataForDifferentDay(reports []entity.DailyReport, checkDate time.Time) bool {
-	if len(reports) == 0 {
-		return false
-	}
-
-	jakartaCheckDate := checkDate.In(config.GetJakartaTimezone())
-	checkDateOnly := time.Date(jakartaCheckDate.Year(), jakartaCheckDate.Month(), jakartaCheckDate.Day(), 0, 0, 0, 0, config.GetJakartaTimezone())
-
-	for _, report := range reports {
-		if reportTime, err := time.Parse(time.RFC3339, report.Date); err == nil {
-			jakartaReportTime := reportTime.In(config.GetJakartaTimezone())
-			reportDateOnly := time.Date(jakartaReportTime.Year(), jakartaReportTime.Month(), jakartaReportTime.Day(), 0, 0, 0, 0, config.GetJakartaTimezone())
-
-			if !reportDateOnly.Equal(checkDateOnly) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func (s *lateDataService) regenerateCrossDayLateData(tenantID string, location entity.Location, locationReports []entity.DailyReport) error {
-	reportsByDate := s.groupReportsByDate(locationReports)
-	successCount := 0
-
-	for dateStr := range reportsByDate {
-		if date, err := time.Parse("2006-01-02", dateStr); err == nil {
-			jakartaDate := date.In(config.GetJakartaTimezone())
-
-			allReportsForDate, err := s.peopleRepo.GetReport(tenantID, location.ID, jakartaDate)
-			if err != nil {
-				continue
-			}
-
-			if s.regenerateDailyReportSafe(tenantID, location, jakartaDate, allReportsForDate) {
-				successCount++
-			}
-		}
-	}
-
-	log.Printf("[LATE_DATA] Cross-day regeneration for %s: %d/%d dates successful",
-		location.LocationCode, successCount, len(reportsByDate))
-	return nil
-}
-
-func (s *lateDataService) groupReportsByDate(reports []entity.DailyReport) map[string][]entity.DailyReport {
-	reportsByDate := make(map[string][]entity.DailyReport)
-
-	for _, report := range reports {
-		if reportTime, err := time.Parse(time.RFC3339, report.Date); err == nil {
-			jakartaTime := reportTime.In(config.GetJakartaTimezone())
-			dateStr := jakartaTime.Format("2006-01-02")
-			reportsByDate[dateStr] = append(reportsByDate[dateStr], report)
-		}
-	}
-
-	return reportsByDate
-}
-
-func (s *lateDataService) mergeAndSortWindows(windows1, windows2 []time.Time) []time.Time {
-	windowSet := make(map[time.Time]bool)
-
-	for _, w := range windows1 {
-		windowSet[w] = true
-	}
-	for _, w := range windows2 {
-		windowSet[w] = true
-	}
-
-	var merged []time.Time
-	for window := range windowSet {
-		merged = append(merged, window)
-	}
-
-	sort.Slice(merged, func(i, j int) bool {
-		return merged[i].Before(merged[j])
-	})
-
-	return merged
-}
-
-func (s *lateDataService) markPreviousFileAsReplaced(fileName string) error {
-	recentLogs, err := s.sftpLogRepo.GetRecentByFileName(fileName, 24*time.Hour)
+	reports, err := s.peopleRepo.GetReportWithTimeRange(tenantID, location.ID, businessHours.StartTime, jakartaTime)
 	if err != nil {
 		return err
 	}
 
-	for _, logEntry := range recentLogs {
-		if logEntry.Status == "SUCCESS" {
-			return s.markFileAsReplaced(logEntry.ID)
-		}
-	}
-	return nil
-}
-
-func (s *lateDataService) regenerateHistoricalLateData(tenantID string, location entity.Location, checkDate time.Time, locationReports []entity.DailyReport) error {
-	if len(locationReports) == 0 || tenantID == "" || location.ID == "" {
+	if len(reports) == 0 {
 		return nil
 	}
 
-	// Regenerate daily report
-	dailySuccess := s.regenerateDailyReportSafe(tenantID, location, checkDate, locationReports)
-
-	// Batch process windows
-	allWindows := s.identifyExistingWindows(locationReports)
-	windowsSuccess := s.regenerateWindowsBatch(tenantID, location, allWindows, locationReports, nil)
-
-	// Summary
-	totalSuccess := 0
-	if dailySuccess {
-		totalSuccess++
-	}
-	totalSuccess += windowsSuccess
-
-	log.Printf("[LATE_DATA] Historical regeneration for %s: %d/%d operations successful",
-		location.LocationCode, totalSuccess, 1+len(allWindows))
+	s.regenDaily(tenantID, location, jakartaTime, reports)
+	s.regenWindows(tenantID, location, jakartaTime, reports)
 
 	return nil
 }
 
-func (s *lateDataService) hasRecentLateDataWithReports(location entity.Location, checkDate time.Time, reports []entity.DailyReport) bool {
+func (s *lateDataService) processHistorical(tenantID string, location entity.Location, checkDate time.Time) error {
+	jakartaDate := checkDate.In(config.GetJakartaTimezone())
+
+	reports, err := s.peopleRepo.GetReport(tenantID, location.ID, jakartaDate)
+	if err != nil {
+		return err
+	}
+
 	if len(reports) == 0 {
-		return false
+		return nil
 	}
 
-	jakartaTime := checkDate.In(config.GetJakartaTimezone())
-	lastExportTime := s.getLastExportTimeForWindow(location, jakartaTime)
-
-	if lastExportTime.IsZero() {
-		return true
-	}
-
-	for _, report := range reports {
-		if reportTime, err := time.Parse(time.RFC3339, report.Date); err == nil {
-			if reportTime.After(lastExportTime) {
-				return true
-			}
-		}
-	}
-	return false
+	s.regenDaily(tenantID, location, jakartaDate, reports)
+	return nil
 }
 
-func (s *lateDataService) hasHistoricalLateDataWithReports(location entity.Location, checkDate time.Time, reports []entity.DailyReport) bool {
-	if len(reports) == 0 {
-		return false
-	}
-
-	dailyExportTime := s.getLastDailyExportTime(location, checkDate)
-	if dailyExportTime.IsZero() {
-		return true
-	}
-
-	return time.Since(dailyExportTime) > 6*time.Hour
-}
-
-func (s *lateDataService) regenerateDailyReport(tenantID string, location entity.Location, date time.Time, reports []entity.DailyReport) error {
+func (s *lateDataService) regenDaily(tenantID string, location entity.Location, date time.Time, reports []entity.DailyReport) {
 	filePath, err := s.csvWriter.WriteDailyReport(tenantID, location.LocationCode, reports, date)
 	if err != nil {
-		return fmt.Errorf("failed to write daily report: %w", err)
+		return
 	}
 
 	fileName := filepath.Base(filePath)
-	s.markPreviousFileAsReplaced(fileName) // Ignore error for non-critical operation
-
-	return s.createLogAndUpload(tenantID, location.ID, filePath, entity.FileTypeDaily)
+	s.markReplaced(fileName)
+	s.upload(tenantID, location.ID, filePath, entity.FileTypeDaily)
 }
 
-func (s *lateDataService) createLogAndUpload(tenantID, locationID, filePath, fileType string) error {
-	fileName := filepath.Base(filePath)
+func (s *lateDataService) regenWindows(tenantID string, location entity.Location, currentTime time.Time, allReports []entity.DailyReport) {
+	windowsMap := s.groupByWindows(allReports)
 
+	var windows []time.Time
+	for windowTime := range windowsMap {
+		if windowTime.Before(currentTime) || windowTime.Equal(currentTime) {
+			windows = append(windows, windowTime)
+		}
+	}
+
+	sort.Slice(windows, func(i, j int) bool {
+		return windows[i].Before(windows[j])
+	})
+
+	for _, windowTime := range windows {
+		cumulativeReports := s.filterUpToWindow(allReports, windowTime)
+		if len(cumulativeReports) == 0 {
+			continue
+		}
+
+		filePath, err := s.csvWriter.Write30MinReport(tenantID, location.LocationCode, cumulativeReports, windowTime)
+		if err != nil {
+			continue
+		}
+
+		fileName := filepath.Base(filePath)
+		s.markReplaced(fileName)
+		s.upload(tenantID, location.ID, filePath, entity.FileType30Min)
+	}
+}
+
+func (s *lateDataService) regenerateCombined(tenantID string, checkDate time.Time) error {
+	jakartaDate := checkDate.In(config.GetJakartaTimezone())
+	businessHours := config.BusinessHours(jakartaDate)
+
+	completeData, err := s.peopleRepo.GetAllReportsForTenantWithTimeRange(tenantID, businessHours.StartTime, businessHours.EndTime)
+	if err != nil {
+		return err
+	}
+
+	if len(completeData) == 0 {
+		return nil
+	}
+
+	reportsByDate := s.groupByDate(completeData)
+
+	for dateStr, reportsForDate := range reportsByDate {
+		reportDate, err := time.Parse("2006-01-02", dateStr)
+		if err != nil {
+			continue
+		}
+
+		fileName := fmt.Sprintf("*%s.csv", reportDate.Format("20060102"))
+		s.markReplaced(fileName)
+
+		filePath, err := s.csvWriter.WriteCombinedReport(tenantID, "*", reportsForDate, reportDate)
+		if err != nil {
+			continue
+		}
+
+		s.upload(tenantID, "ALL", filePath, entity.FileType30Min)
+	}
+
+	return nil
+}
+
+func (s *lateDataService) upload(tenantID, locationID, filePath, fileType string) error {
+	fileName := filepath.Base(filePath)
 	tenantConfig, exists := config.GetTenantByID(tenantID)
 	if !exists {
-		return fmt.Errorf("tenant %s not found", tenantID)
+		return fmt.Errorf("tenant not found")
 	}
 
 	fileInfo, err := os.Stat(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to get file info: %w", err)
+		return err
 	}
 
 	recordCount := utils.CountFileRecords(filePath)
-	remotePath := strings.ReplaceAll(filepath.Join(tenantConfig.SFTP.BasePath, fileName), "\\", "/")
 
-	if s.isDuplicateUploadForLateData(tenantID, locationID, fileName, fileInfo.Size(), recordCount) {
+	var remotePath string
+	isCombined := strings.HasPrefix(fileName, "*") || locationID == "ALL"
+
+	if isCombined {
+		remotePath = strings.ReplaceAll(filepath.Join(tenantConfig.SFTP.CombinedPath, fileName), "\\", "/")
+	} else {
+		remotePath = strings.ReplaceAll(filepath.Join(tenantConfig.SFTP.BasePath, fileName), "\\", "/")
+	}
+
+	if s.isDuplicate(tenantID, locationID, fileName, fileInfo.Size(), recordCount) {
 		return nil
 	}
 
@@ -537,6 +294,7 @@ func (s *lateDataService) createLogAndUpload(tenantID, locationID, filePath, fil
 		RecordCount:       &recordCount,
 		FileType:          fileType,
 		CreatedAt:         time.Now(),
+		Environment:       config.GetEnvironment(),
 	}
 
 	if locationID != "ALL" {
@@ -544,7 +302,7 @@ func (s *lateDataService) createLogAndUpload(tenantID, locationID, filePath, fil
 	}
 
 	if err := s.sftpLogRepo.Create(transferLog); err != nil {
-		return fmt.Errorf("failed to create transfer log: %w", err)
+		return err
 	}
 
 	uploadJob := types.UploadSFTPJob{
@@ -561,138 +319,135 @@ func (s *lateDataService) createLogAndUpload(tenantID, locationID, filePath, fil
 	if err := s.sftpService.UploadFile(uploadJob); err != nil {
 		errorMsg := err.Error()
 		s.sftpLogRepo.UpdateStatus(transferLog.ID, "FAILED", &errorMsg)
-		return fmt.Errorf("upload failed: %w", err)
+		return err
 	}
 
 	return nil
 }
 
-func (s *lateDataService) validateCheckType(checkType string) error {
-	validTypes := []string{"realtime", "historical"}
-	trimmedType := strings.TrimSpace(checkType)
-
-	for _, valid := range validTypes {
-		if trimmedType == valid {
-			return nil
-		}
-	}
-
-	return fmt.Errorf("invalid check type '%s', must be one of: %v", checkType, validTypes)
-}
-
-func (s *lateDataService) getLastExportTimeForWindow(location entity.Location, windowTime time.Time) time.Time {
-	jakartaTime := windowTime.In(config.GetJakartaTimezone())
-	fileName := fmt.Sprintf("%s_%s_%s.csv", location.LocationCode, jakartaTime.Format("20060102"), jakartaTime.Format("1504"))
-
-	if transferLog, err := s.sftpLogRepo.GetByFileName(fileName); err == nil && transferLog != nil {
-		if transferLog.TransferEndTime != nil && transferLog.Status == "SUCCESS" {
-			return *transferLog.TransferEndTime
-		}
-	}
-	return time.Time{}
-}
-
-func (s *lateDataService) getLastDailyExportTime(location entity.Location, date time.Time) time.Time {
-	fileName := fmt.Sprintf("%s_%s.csv", location.LocationCode, date.Format("20060102"))
-
-	if transferLog, err := s.sftpLogRepo.GetByFileName(fileName); err == nil && transferLog != nil {
-		if transferLog.TransferEndTime != nil && transferLog.Status == "SUCCESS" {
-			return *transferLog.TransferEndTime
-		}
-	}
-	return time.Time{}
-}
-
-func (s *lateDataService) identifyExistingWindows(allReports []entity.DailyReport) []time.Time {
-	windowSet := make(map[time.Time]bool)
-
-	for _, report := range allReports {
+func (s *lateDataService) groupByWindows(reports []entity.DailyReport) map[time.Time][]entity.DailyReport {
+	windows := make(map[time.Time][]entity.DailyReport)
+	for _, report := range reports {
 		if reportTime, err := time.Parse(time.RFC3339, report.Date); err == nil {
 			windowStart := reportTime.Truncate(30 * time.Minute).Add(30 * time.Minute)
-			windowSet[windowStart] = true
+			windows[windowStart] = append(windows[windowStart], report)
 		}
 	}
-
-	var windows []time.Time
-	for window := range windowSet {
-		windows = append(windows, window)
-	}
-
-	sort.Slice(windows, func(i, j int) bool {
-		return windows[i].Before(windows[j])
-	})
-
 	return windows
 }
 
-func (s *lateDataService) isDuplicateUploadForLateData(tenantID, locationID, fileName string, fileSize int64, recordCount int) bool {
-	recentLogs, err := s.sftpLogRepo.GetRecentByFileName(fileName, 5*time.Minute)
-	if err != nil {
-		return false
-	}
+func (s *lateDataService) groupByDate(reports []entity.DailyReport) map[string][]entity.DailyReport {
+	reportsByDate := make(map[string][]entity.DailyReport)
 
-	for _, recentLog := range recentLogs {
-		if recentLog.TenantID == tenantID && recentLog.LocationID == &locationID {
-			timeDiff := time.Since(recentLog.CreatedAt)
-
-			if recentLog.Status == "REPLACED" {
-				continue
-			}
-
-			if recentLog.RecordCount != nil {
-				oldRecordCount := *recentLog.RecordCount
-
-				// Exact duplicate
-				if recordCount == oldRecordCount &&
-					recentLog.FileSize == fileSize &&
-					timeDiff < 2*time.Minute &&
-					(recentLog.Status == "SUCCESS" || recentLog.Status == "PENDING") {
-					return true
-				}
-
-				// Impossible decrease
-				if recordCount < oldRecordCount {
-					log.Printf("[LATE_DATA] 🚨 Record count decreased %d→%d for %s", oldRecordCount, recordCount, fileName)
-					return true
-				}
-
-				// Allow increases (legitimate late data)
-				if recordCount > oldRecordCount {
-					return false
-				}
-			}
-
-			// Very recent duplicate
-			if timeDiff < 2*time.Minute &&
-				recentLog.FileSize == fileSize &&
-				(recentLog.Status == "SUCCESS" || recentLog.Status == "PENDING") {
-				return true
-			}
+	for _, report := range reports {
+		if reportTime, err := time.Parse(time.RFC3339, report.Date); err == nil {
+			jakartaTime := reportTime.In(config.GetJakartaTimezone())
+			businessDate := s.getBusinessDate(jakartaTime)
+			dateStr := businessDate.Format("2006-01-02")
+			reportsByDate[dateStr] = append(reportsByDate[dateStr], report)
 		}
 	}
-	return false
+
+	return reportsByDate
 }
 
-func (s *lateDataService) filterCumulativeDataUpToWindow(allReports []entity.DailyReport, windowTime time.Time) []entity.DailyReport {
-	var cumulativeReports []entity.DailyReport
+func (s *lateDataService) getBusinessDate(jakartaTime time.Time) time.Time {
+	if jakartaTime.Hour() < 8 {
+		return jakartaTime.AddDate(0, 0, -1)
+	}
+	return jakartaTime
+}
+
+func (s *lateDataService) filterUpToWindow(allReports []entity.DailyReport, windowTime time.Time) []entity.DailyReport {
+	var filtered []entity.DailyReport
 	jakartaWindowTime := windowTime.In(config.GetJakartaTimezone())
 
 	for _, report := range allReports {
 		if reportTime, err := time.Parse(time.RFC3339, report.Date); err == nil {
 			jakartaReportTime := reportTime.In(config.GetJakartaTimezone())
 			if jakartaReportTime.Before(jakartaWindowTime) || jakartaReportTime.Equal(jakartaWindowTime) {
-				cumulativeReports = append(cumulativeReports, report)
+				filtered = append(filtered, report)
 			}
 		}
 	}
 
-	return cumulativeReports
+	return filtered
 }
 
-func (s *lateDataService) groupReportsByLocation(allReports []entity.DailyReport) map[string][]entity.DailyReport {
-	reportsByLocation := make(map[string][]entity.DailyReport)
-	for _, report := range allReports {
-		reportsByLocation[report.LocationID] = append(reportsByLocation[report.LocationID], report)
+func (s *lateDataService) markReplaced(fileName string) {
+	recentLogs, err := s.sftpLogRepo.GetRecentByFileName(fileName, 24*time.Hour)
+	if err != nil {
+		return
 	}
-	return reportsByLocation
+
+	for _, logEntry := range recentLogs {
+		if logEntry.Status == "SUCCESS" {
+			replacedMsg := fmt.Sprintf("Replaced at %s", time.Now().Format("2006-01-02 15:04:05"))
+			s.sftpLogRepo.UpdateStatus(logEntry.ID, "REPLACED", &replacedMsg)
+			return
+		}
+	}
+}
+
+func (s *lateDataService) isDuplicate(tenantID, locationID, fileName string, fileSize int64, recordCount int) bool {
+	recentLogs, err := s.sftpLogRepo.GetRecentByFileName(fileName, 2*time.Minute)
+	if err != nil {
+		return false
+	}
+
+	for _, recentLog := range recentLogs {
+		if recentLog.TenantID == tenantID {
+			var logLocationID string
+			if recentLog.LocationID != nil {
+				logLocationID = *recentLog.LocationID
+			} else {
+				logLocationID = "ALL"
+			}
+
+			if logLocationID == locationID {
+				if recentLog.Status == "REPLACED" {
+					continue
+				}
+
+				if recentLog.RecordCount != nil {
+					oldCount := *recentLog.RecordCount
+					if recordCount == oldCount && recentLog.FileSize == fileSize &&
+						(recentLog.Status == "SUCCESS" || recentLog.Status == "PENDING") {
+						return true
+					}
+					if recordCount < oldCount {
+						return true
+					}
+				}
+
+				if recentLog.FileSize == fileSize &&
+					(recentLog.Status == "SUCCESS" || recentLog.Status == "PENDING") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (s *lateDataService) validate(checkType string) error {
+	validTypes := []string{"realtime", "historical"}
+	trimmed := strings.TrimSpace(checkType)
+
+	for _, valid := range validTypes {
+		if trimmed == valid {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("invalid check type: %s", checkType)
+}
+
+func (s *lateDataService) contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
 }
