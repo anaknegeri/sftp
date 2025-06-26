@@ -119,44 +119,50 @@ func (s *SFTPGRPCServer) ExportAllReport(ctx context.Context, req *pb.ExportAllR
 		return nil, status.Error(codes.InvalidArgument, "invalid date format, use YYYY-MM-DD")
 	}
 
-	// Queue both daily and 30min jobs
-	dailyJob := types.GenerateReportJob{
-		TenantID:  req.TenantId,
-		Date:      date,
-		JobType:   "daily",
-		CreatedAt: time.Now(),
-	}
+	// Execute directly with timeout
+	exportCtx, cancel := context.WithTimeout(ctx, 15*time.Minute) // Increased timeout
+	defer cancel()
 
-	thirtyMinJob := types.GenerateReportJob{
-		TenantID:  req.TenantId,
-		Date:      date,
-		JobType:   "30min",
-		CreatedAt: time.Now(),
-	}
+	// Execute in goroutine to handle timeout
+	done := make(chan error, 1)
+	var exportErr error
 
-	// Queue daily job
-	if err := s.jobQueue.PublishJob(types.SubjectGenerateReport, dailyJob); err != nil {
-		log.Printf("[GRPC] Failed to queue daily job for tenant %s: %v", req.TenantId, err)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[GRPC] PANIC in ExportAllReport for tenant %s: %v", req.TenantId, r)
+				done <- fmt.Errorf("export panicked: %v", r)
+			}
+		}()
+
+		// Execute ExportAllReport directly
+		exportErr = s.exportService.ExportAllReport(req.TenantId, date)
+		done <- exportErr
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			log.Printf("[GRPC] ExportAllReport failed for tenant %s: %v", req.TenantId, err)
+			return &pb.ExportResponse{
+				Success: false,
+				Message: fmt.Sprintf("Export failed: %v", err),
+			}, nil
+		}
+
+		log.Printf("[GRPC] ExportAllReport completed successfully for tenant: %s", req.TenantId)
+		return &pb.ExportResponse{
+			Success: true,
+			Message: fmt.Sprintf("Complete export (daily + 30min) completed successfully for %s", req.Date),
+		}, nil
+
+	case <-exportCtx.Done():
+		log.Printf("[GRPC] ExportAllReport timeout for tenant: %s", req.TenantId)
 		return &pb.ExportResponse{
 			Success: false,
-			Message: fmt.Sprintf("Failed to queue daily export job: %v", err),
+			Message: "Export operation timed out after 15 minutes. Some exports may still be processing in background.",
 		}, nil
 	}
-
-	// Queue 30min job
-	if err := s.jobQueue.PublishJob(types.SubjectGenerateReport, thirtyMinJob); err != nil {
-		log.Printf("[GRPC] Failed to queue 30min job for tenant %s: %v", req.TenantId, err)
-		return &pb.ExportResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to queue 30min export job: %v", err),
-		}, nil
-	}
-
-	log.Printf("[GRPC] All export jobs queued successfully for tenant: %s", req.TenantId)
-	return &pb.ExportResponse{
-		Success: true,
-		Message: fmt.Sprintf("Complete export jobs (daily + 30min) queued successfully for %s. Processing will start shortly.", req.Date),
-	}, nil
 }
 
 // ASYNC: ExportByLocationID - Queue job and return immediately

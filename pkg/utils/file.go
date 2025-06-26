@@ -3,6 +3,7 @@ package utils
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	"jarvist/sftp-service/internal/domain/entity"
 )
@@ -20,6 +21,16 @@ func DetermineFileType(fileName string) string {
 			afterDate := fileName[len(fileName)-4:] // Should be ".csv"
 			if afterDate == ".csv" {
 				return entity.FileTypeDaily
+			}
+		}
+	}
+
+	// Check for combined report first (format: *YYYYMMDD.csv)
+	if strings.HasPrefix(fileName, "*") && len(fileName) == 13 { // "*20250102.csv" = 13 characters
+		possibleDate := fileName[1:9] // Extract YYYYMMDD part (skip the "*")
+		if len(possibleDate) == 8 && possibleDate[0] == '2' && possibleDate[1] == '0' {
+			if strings.HasSuffix(fileName, ".csv") {
+				return entity.FileType30Min // Combined reports are treated as 30min type
 			}
 		}
 	}

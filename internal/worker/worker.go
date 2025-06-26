@@ -214,10 +214,10 @@ func (w *NATSWorker) Start() error {
 		"generate-report": {
 			Subject:     SubjectGenerateReport,
 			Handler:     w.handleGenerateReport,
-			Concurrency: 1,                 // Single worker to prevent race conditions
+			Concurrency: 2,                 // Single worker to prevent race conditions
 			BatchSize:   1,                 // Process one at a time
 			AckWait:     300 * time.Second, // Longer timeout for export
-			MaxDeliver:  2,                 // Reduced max deliver
+			MaxDeliver:  3,                 // Reduced max deliver
 		},
 		"upload-sftp": {
 			Subject:     SubjectUploadSFTP,
@@ -225,7 +225,7 @@ func (w *NATSWorker) Start() error {
 			Concurrency: 50,               // HIGH CONCURRENCY for uploads
 			BatchSize:   10,               // Larger batch for efficiency
 			AckWait:     60 * time.Second, // Shorter timeout for uploads
-			MaxDeliver:  2,                // Quick failure for problematic uploads
+			MaxDeliver:  3,                // Quick failure for problematic uploads
 		},
 		"late-data-check": {
 			Subject:     SubjectLateDataCheck,
@@ -233,7 +233,7 @@ func (w *NATSWorker) Start() error {
 			Concurrency: 1, // Single worker
 			BatchSize:   1,
 			AckWait:     300 * time.Second,
-			MaxDeliver:  2,
+			MaxDeliver:  3,
 		},
 	}
 

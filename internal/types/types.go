@@ -34,7 +34,7 @@ type UploadSFTPJob struct {
 	FileName   string    `json:"file_name"`
 	RemotePath string    `json:"remote_path"`
 	FileType   string    `json:"file_type"`
-	LocationID string    `json:"location_id,omitempty"`
+	LocationID string    `json:"location_id"`
 	CreatedAt  time.Time `json:"created_at"`
 }
 

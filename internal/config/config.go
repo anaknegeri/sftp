@@ -23,11 +23,12 @@ const (
 )
 
 type Config struct {
-	Database  Database
-	LocalPath string
-	LogPath   string
-	GRPCPort  string
-	NATS      NATSConfig
+	Database    Database
+	LocalPath   string
+	LogPath     string
+	GRPCPort    string
+	NATS        NATSConfig
+	Environment string
 }
 
 type Database struct {
@@ -70,6 +71,7 @@ func Load() *Config {
 	godotenv.Load()
 
 	return &Config{
+		Environment: getEnv("ENVIRONMENT", "production"),
 		Database: Database{
 			Host:     getEnv("DB_HOST", "localhost"),
 			Port:     getEnv("DB_PORT", "5432"),
@@ -199,6 +201,10 @@ func GetJakartaTimezone() *time.Location {
 		return time.UTC
 	}
 	return loc
+}
+
+func GetEnvironment() string {
+	return getEnv("ENVIRONMENT", "production")
 }
 
 func NowJakarta() time.Time {

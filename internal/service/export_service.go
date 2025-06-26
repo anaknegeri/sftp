@@ -196,6 +196,12 @@ func (s *exportService) ExportAllReport(tenantID string, date time.Time) error {
 		return nil
 	}
 
+	if err := s.generateCombinedReport(tenantID, date, allReports); err != nil {
+		log.Printf("[EXPORT] Failed to generate combined report: %v", err)
+	} else {
+		log.Printf("[EXPORT] Combined report generated successfully")
+	}
+
 	reportsByLocation := s.groupReportsByLocation(allReports)
 	successCount := 0
 
@@ -298,6 +304,7 @@ func (s *exportService) Export30Min(tenantID string, triggerTime time.Time) erro
 		return nil
 	}
 
+	// 1. Generate individual location files (existing logic)
 	reportsByLocation := s.groupReportsByLocation(allReports)
 	successCount := 0
 
@@ -309,6 +316,13 @@ func (s *exportService) Export30Min(tenantID string, triggerTime time.Time) erro
 			}
 			successCount++
 		}
+	}
+
+	// 2. NEW: Generate combined file for all locations
+	if err := s.generateCombinedReport(tenantID, triggerTime, allReports); err != nil {
+		log.Printf("[30MIN] Failed to generate combined report: %v", err)
+	} else {
+		log.Printf("[30MIN] Combined report generated successfully")
 	}
 
 	log.Printf("[30MIN] Export completed: %d/%d locations successful", successCount, len(locations))
@@ -629,7 +643,9 @@ func (s *exportService) generateAndQueueFile(tenantID string, location entity.Lo
 		return fmt.Errorf("generated file is invalid: %s", filePath)
 	}
 
-	return s.createLogAndQueueUpload(tenantID, location.ID, filePath)
+	locationIDForLog := location.ID
+
+	return s.createLogAndQueueUpload(tenantID, locationIDForLog, filePath)
 }
 
 func (s *exportService) validateGeneratedFile(filePath string) bool {
@@ -672,9 +688,25 @@ func (s *exportService) createLogAndQueueUpload(tenantID, locationID, filePath s
 	}
 
 	recordCount := utils.CountFileRecords(filePath)
-	remotePath := strings.ReplaceAll(filepath.Join(tenantConfig.SFTP.BasePath, fileName), "\\", "/")
 
-	// Check for duplicates
+	var remotePath string
+
+	isCombinedFile := strings.HasPrefix(fileName, "*") || locationID == "ALL"
+
+	if isCombinedFile {
+		remotePath = strings.ReplaceAll(filepath.Join(tenantConfig.SFTP.CombinedPath, fileName), "\\", "/")
+	} else {
+		remotePath = strings.ReplaceAll(filepath.Join(tenantConfig.SFTP.BasePath, fileName), "\\", "/")
+	}
+
+	var dbLocationID *string
+	if locationID == "ALL" || locationID == "" {
+		dbLocationID = nil
+	} else {
+		dbLocationID = &locationID
+	}
+
+	// Check for duplicates with proper LocationID handling
 	if s.isDuplicateUploadWithContext(tenantID, locationID, fileName, fileInfo.Size(), recordCount, "export") {
 		log.Printf("[EXPORT] Skipping duplicate: %s", fileName)
 		return nil
@@ -684,11 +716,11 @@ func (s *exportService) createLogAndQueueUpload(tenantID, locationID, filePath s
 		log.Printf("[EXPORT] Warning: failed to mark previous file as replaced: %v", err)
 	}
 
-	// Create log entry
+	// Create log entry with proper LocationID handling
 	transferLog := &entity.SFTPTransferLog{
 		ID:                uuid.New().String(),
 		TenantID:          tenantID,
-		LocationID:        locationID,
+		LocationID:        dbLocationID, // nil for combined files, actual ID for individual files
 		FileName:          fileName,
 		FilePath:          filePath,
 		RemotePath:        remotePath,
@@ -698,6 +730,7 @@ func (s *exportService) createLogAndQueueUpload(tenantID, locationID, filePath s
 		RecordCount:       &recordCount,
 		FileType:          fileType,
 		CreatedAt:         time.Now(),
+		Environment:       config.GetEnvironment(), // Set environment
 	}
 
 	if err := s.sftpLogRepo.Create(transferLog); err != nil {
@@ -712,7 +745,7 @@ func (s *exportService) createLogAndQueueUpload(tenantID, locationID, filePath s
 		FileName:   fileName,
 		RemotePath: remotePath,
 		FileType:   fileType,
-		LocationID: locationID,
+		LocationID: locationID, // Keep as string for job processing
 		CreatedAt:  time.Now(),
 	}
 
@@ -732,16 +765,23 @@ func (s *exportService) markPreviousFileAsReplaced(fileName, tenantID, locationI
 	}
 
 	for _, logEntry := range recentLogs {
-		if logEntry.TenantID == tenantID &&
-			logEntry.LocationID == locationID &&
-			logEntry.Status == "SUCCESS" {
-			replacedMsg := fmt.Sprintf("File replaced with updated data at %s", time.Now().Format("2006-01-02 15:04:05"))
-			if err := s.sftpLogRepo.UpdateStatus(logEntry.ID, "REPLACED", &replacedMsg); err != nil {
-				log.Printf("[EXPORT] Failed to update replaced status for %s: %v", logEntry.FileName, err)
+		if logEntry.TenantID == tenantID {
+			var logLocationID string
+			if logEntry.LocationID != nil {
+				logLocationID = *logEntry.LocationID
 			} else {
-				log.Printf("[EXPORT] Marked previous file as REPLACED: %s", logEntry.FileName)
+				logLocationID = "ALL"
 			}
-			break
+
+			if logLocationID == locationID && logEntry.Status == "SUCCESS" {
+				replacedMsg := fmt.Sprintf("File replaced with updated data at %s", time.Now().Format("2006-01-02 15:04:05"))
+				if err := s.sftpLogRepo.UpdateStatus(logEntry.ID, "REPLACED", &replacedMsg); err != nil {
+					log.Printf("[EXPORT] Failed to update replaced status for %s: %v", logEntry.FileName, err)
+				} else {
+					log.Printf("[EXPORT] Marked previous file as REPLACED: %s", logEntry.FileName)
+				}
+				break
+			}
 		}
 	}
 
@@ -755,75 +795,86 @@ func (s *exportService) isDuplicateUploadWithContext(tenantID, locationID, fileN
 	}
 
 	for _, recentLog := range recentLogs {
-		if recentLog.TenantID == tenantID && recentLog.LocationID == locationID {
-			timeDiff := time.Since(recentLog.CreatedAt)
-
-			if recentLog.Status == "REPLACED" {
-				continue
+		if recentLog.TenantID == tenantID {
+			// Handle LocationID comparison with nullable field
+			var logLocationID string
+			if recentLog.LocationID != nil {
+				logLocationID = *recentLog.LocationID
+			} else {
+				logLocationID = "ALL" // For combined files
 			}
 
-			if recentLog.RecordCount != nil {
-				oldRecordCount := *recentLog.RecordCount
+			// Compare LocationIDs
+			if logLocationID == locationID {
+				timeDiff := time.Since(recentLog.CreatedAt)
 
-				if context == "late_data" {
-					if timeDiff < 1*time.Minute &&
-						recordCount == oldRecordCount &&
+				if recentLog.Status == "REPLACED" {
+					continue
+				}
+
+				if recentLog.RecordCount != nil {
+					oldRecordCount := *recentLog.RecordCount
+
+					if context == "late_data" {
+						if timeDiff < 1*time.Minute &&
+							recordCount == oldRecordCount &&
+							recentLog.FileSize == fileSize &&
+							(recentLog.Status == "SUCCESS" || recentLog.Status == "PENDING") {
+							log.Printf("[EXPORT] Blocking recent exact duplicate in late_data context: %s", fileName)
+							return true
+						}
+
+						if recordCount < oldRecordCount {
+							log.Printf("[EXPORT] 🚨 Blocking impossible decrease in late_data: %s (%d → %d)", fileName, oldRecordCount, recordCount)
+							return true
+						}
+
+						return false
+					}
+
+					if recordCount == oldRecordCount &&
 						recentLog.FileSize == fileSize &&
+						timeDiff < 5*time.Minute &&
 						(recentLog.Status == "SUCCESS" || recentLog.Status == "PENDING") {
-						log.Printf("[EXPORT] Blocking recent exact duplicate in late_data context: %s", fileName)
+						log.Printf("[EXPORT] Blocking exact duplicate: %s (same count: %d)", fileName, recordCount)
 						return true
 					}
 
 					if recordCount < oldRecordCount {
-						log.Printf("[EXPORT] 🚨 Blocking impossible decrease in late_data: %s (%d → %d)", fileName, oldRecordCount, recordCount)
+						log.Printf("[EXPORT] 🚨 CRITICAL: Record count decreased from %d to %d for %s - possible data corruption!", oldRecordCount, recordCount, fileName)
 						return true
 					}
 
-					return false
+					if recordCount > oldRecordCount && recordCount <= oldRecordCount+3 {
+						if timeDiff < 3*time.Minute {
+							log.Printf("[EXPORT] Blocking minor increase within time threshold: %s (%d → %d, %v ago)", fileName, oldRecordCount, recordCount, timeDiff)
+							return true
+						}
+
+						log.Printf("[EXPORT] Allowing minor late data increase: %s (%d → %d records)",
+							fileName, oldRecordCount, recordCount)
+						return false
+					}
+
+					if recordCount > oldRecordCount+3 {
+						log.Printf("[EXPORT] Allowing significant data increase: %s (%d → %d records)",
+							fileName, oldRecordCount, recordCount)
+						return false
+					}
 				}
 
-				if recordCount == oldRecordCount &&
-					recentLog.FileSize == fileSize &&
-					timeDiff < 5*time.Minute &&
+				if timeDiff < 30*time.Second &&
 					(recentLog.Status == "SUCCESS" || recentLog.Status == "PENDING") {
-					log.Printf("[EXPORT] Blocking exact duplicate: %s (same count: %d)", fileName, recordCount)
+					log.Printf("[EXPORT] Blocking very recent upload: %s (%v ago)", fileName, timeDiff)
 					return true
 				}
 
-				if recordCount < oldRecordCount {
-					log.Printf("[EXPORT] 🚨 CRITICAL: Record count decreased from %d to %d for %s - possible data corruption!", oldRecordCount, recordCount, fileName)
+				if recentLog.Status == "SUCCESS" &&
+					recentLog.FileSize > 0 &&
+					timeDiff < 2*time.Minute {
+					log.Printf("[EXPORT] Blocking recent successful upload: %s (%v ago)", fileName, timeDiff)
 					return true
 				}
-
-				if recordCount > oldRecordCount && recordCount <= oldRecordCount+3 {
-					if timeDiff < 3*time.Minute {
-						log.Printf("[EXPORT] Blocking minor increase within time threshold: %s (%d → %d, %v ago)", fileName, oldRecordCount, recordCount, timeDiff)
-						return true
-					}
-
-					log.Printf("[EXPORT] Allowing minor late data increase: %s (%d → %d records)",
-						fileName, oldRecordCount, recordCount)
-					return false
-				}
-
-				if recordCount > oldRecordCount+3 {
-					log.Printf("[EXPORT] Allowing significant data increase: %s (%d → %d records)",
-						fileName, oldRecordCount, recordCount)
-					return false
-				}
-			}
-
-			if timeDiff < 30*time.Second &&
-				(recentLog.Status == "SUCCESS" || recentLog.Status == "PENDING") {
-				log.Printf("[EXPORT] Blocking very recent upload: %s (%v ago)", fileName, timeDiff)
-				return true
-			}
-
-			if recentLog.Status == "SUCCESS" &&
-				recentLog.FileSize > 0 &&
-				timeDiff < 2*time.Minute {
-				log.Printf("[EXPORT] Blocking recent successful upload: %s (%v ago)", fileName, timeDiff)
-				return true
 			}
 		}
 	}
@@ -865,4 +916,36 @@ func (s *exportService) filterCumulativeDataUpToWindow(allReports []entity.Daily
 		}
 	}
 	return cumulativeReports
+}
+
+func (s *exportService) generateCombinedReport(tenantID string, triggerTime time.Time, allReports []entity.DailyReport) error {
+	jakartaTriggerTime := triggerTime.In(config.GetJakartaTimezone())
+
+	// Create a virtual location for combined report
+	combinedLocation := entity.Location{
+		ID:           "ALL", // This is just for internal processing
+		LocationCode: "*",   // Use "*" as location code for combined report
+		Name:         "All Locations Combined",
+	}
+
+	exportKey := ExportKey{
+		TenantID:   tenantID,
+		LocationID: "ALL",
+		Date:       jakartaTriggerTime.Format("20060102"),
+		Type:       "30min_combined",
+	}
+
+	if !s.acquireExportLock(exportKey) {
+		return nil // Skip duplicate
+	}
+	defer s.releaseExportLock(exportKey)
+
+	if !s.acquireFileGenerationLock(exportKey) {
+		return nil // File generation in progress
+	}
+	defer s.releaseFileGenerationLock(exportKey)
+
+	return s.generateAndQueueFile(tenantID, combinedLocation, allReports, func() (string, error) {
+		return s.csvWriter.WriteCombinedReport(tenantID, combinedLocation.LocationCode, allReports, jakartaTriggerTime)
+	})
 }

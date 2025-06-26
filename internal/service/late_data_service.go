@@ -220,7 +220,7 @@ func (s *lateDataService) getExistingWindowsBatch(location entity.Location, date
 
 	for _, transferLog := range allRecentLogs {
 		if transferLog.TenantID == location.TenantID &&
-			transferLog.LocationID == location.ID &&
+			transferLog.LocationID == &location.ID &&
 			strings.HasPrefix(transferLog.FileName, filePattern) &&
 			(transferLog.Status == "SUCCESS" || transferLog.Status == "PENDING") {
 
@@ -528,7 +528,6 @@ func (s *lateDataService) createLogAndUpload(tenantID, locationID, filePath, fil
 	transferLog := &entity.SFTPTransferLog{
 		ID:                uuid.New().String(),
 		TenantID:          tenantID,
-		LocationID:        locationID,
 		FileName:          fileName,
 		FilePath:          filePath,
 		RemotePath:        remotePath,
@@ -538,6 +537,10 @@ func (s *lateDataService) createLogAndUpload(tenantID, locationID, filePath, fil
 		RecordCount:       &recordCount,
 		FileType:          fileType,
 		CreatedAt:         time.Now(),
+	}
+
+	if locationID != "ALL" {
+		transferLog.LocationID = &locationID
 	}
 
 	if err := s.sftpLogRepo.Create(transferLog); err != nil {
@@ -629,7 +632,7 @@ func (s *lateDataService) isDuplicateUploadForLateData(tenantID, locationID, fil
 	}
 
 	for _, recentLog := range recentLogs {
-		if recentLog.TenantID == tenantID && recentLog.LocationID == locationID {
+		if recentLog.TenantID == tenantID && recentLog.LocationID == &locationID {
 			timeDiff := time.Since(recentLog.CreatedAt)
 
 			if recentLog.Status == "REPLACED" {

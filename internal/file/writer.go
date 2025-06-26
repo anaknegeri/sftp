@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 type CSVWriter interface {
 	Write30MinReport(tenantID, locationCode string, reports []entity.DailyReport, date time.Time) (string, error)
 	WriteDailyReport(tenantID, locationCode string, reports []entity.DailyReport, date time.Time) (string, error)
+	WriteCombinedReport(tenantID, locationCode string, reports []entity.DailyReport, date time.Time) (string, error) // NEW
 }
 
 type csvWriter struct {
@@ -132,8 +134,6 @@ func (w *csvWriter) parsePostgreSQLTimestamp(dateStr string) (time.Time, error) 
 	var lastErr error
 	for _, format := range formats {
 		if t, err := time.Parse(format, dateStr); err == nil {
-			// Jika sudah ada timezone info (+07), jangan konversi lagi
-			// Hanya konversi ke Jakarta jika tidak ada timezone info
 			if format == "2006-01-02 15:04:05" {
 				return t.In(jakartaLocation), nil
 			}
@@ -144,4 +144,85 @@ func (w *csvWriter) parsePostgreSQLTimestamp(dateStr string) (time.Time, error) 
 	}
 
 	return time.Time{}, fmt.Errorf("failed to parse PostgreSQL timestamp '%s' with any known format: %w", dateStr, lastErr)
+}
+
+func (w *csvWriter) WriteCombinedReport(tenantID, locationCode string, reports []entity.DailyReport, date time.Time) (string, error) {
+	jakartaDate := date.In(jakartaLocation)
+	fileName := fmt.Sprintf("%s.csv", jakartaDate.Format("20060102"))
+
+	log.Printf("[CSV_WRITER] Starting to write combined report with %d reports to file %s", len(reports), fileName)
+
+	if len(reports) == 0 {
+		return "", fmt.Errorf("no data to export for combined report")
+	}
+
+	tenantDir := filepath.Join(w.basePath, tenantID)
+	if err := os.MkdirAll(tenantDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create tenant directory: %w", err)
+	}
+
+	filePath := filepath.Join(tenantDir, fileName)
+	file, err := os.Create(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to create combined file: %w", err)
+	}
+	defer file.Close()
+
+	csvWriter := csv.NewWriter(file)
+	defer csvWriter.Flush()
+
+	// Same header format as individual reports
+	header := []string{"Store_ID", "Device_ID", "Date", "Hour", "Total enters", "Total exited"}
+	if err := csvWriter.Write(header); err != nil {
+		return "", fmt.Errorf("failed to write header: %w", err)
+	}
+
+	// Sort reports by location code first, then by time for better organization
+	sortedReports := make([]entity.DailyReport, len(reports))
+	copy(sortedReports, reports)
+
+	sort.Slice(sortedReports, func(i, j int) bool {
+		if sortedReports[i].LocationCode != sortedReports[j].LocationCode {
+			return sortedReports[i].LocationCode < sortedReports[j].LocationCode
+		}
+		return sortedReports[i].Date < sortedReports[j].Date
+	})
+
+	successCount := 0
+	errorCount := 0
+
+	for i, report := range sortedReports {
+		t, err := w.parsePostgreSQLTimestamp(report.Date)
+		if err != nil {
+			errorCount++
+			log.Printf("[CSV_WRITER] ERROR: Failed to parse date for combined record %d: '%s' - %v", i+1, report.Date, err)
+			continue
+		}
+
+		row := []string{
+			report.LocationCode,
+			report.DeviceName,
+			t.Format("20060102"),
+			t.Format("150405"),
+			strconv.FormatInt(report.TotalIn, 10),
+			strconv.FormatInt(report.TotalOut, 10),
+		}
+
+		if err := csvWriter.Write(row); err != nil {
+			errorCount++
+			log.Printf("[CSV_WRITER] ERROR: Failed to write combined record %d: %v", i+1, err)
+			continue
+		}
+
+		successCount++
+	}
+
+	log.Printf("[CSV_WRITER] Completed writing combined report %s: %d success, %d errors out of %d total",
+		fileName, successCount, errorCount, len(sortedReports))
+
+	if successCount == 0 {
+		return "", fmt.Errorf("no valid records written to combined file - all %d records had errors", len(sortedReports))
+	}
+
+	return filePath, nil
 }

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -380,6 +381,13 @@ func (s *sftpService) UploadAllPendingFiles(tenantID string) error {
 				continue
 			}
 
+			var locationID string
+			if logEntry.LocationID != nil {
+				locationID = *logEntry.LocationID
+			} else {
+				locationID = "ALL"
+			}
+
 			validJobs = append(validJobs, types.UploadSFTPJob{
 				LogID:      logEntry.ID,
 				TenantID:   logEntry.TenantID,
@@ -387,7 +395,7 @@ func (s *sftpService) UploadAllPendingFiles(tenantID string) error {
 				FileName:   logEntry.FileName,
 				RemotePath: logEntry.RemotePath,
 				FileType:   logEntry.FileType,
-				LocationID: logEntry.LocationID,
+				LocationID: locationID,
 				CreatedAt:  time.Now(),
 			})
 		}
@@ -733,11 +741,93 @@ func (s *sftpService) createNewConnection(pool *SFTPConnectionPool, connKey stri
 		isHealthy:  true,
 	}
 
+	if err := s.initializeDirectories(conn, tenantConfig); err != nil {
+		log.Printf("[SFTP] Warning: Failed to initialize directories for tenant %s: %v", tenantConfig.ID, err)
+	}
+
 	pool.mu.Lock()
 	pool.connections[connKey] = conn
 	pool.mu.Unlock()
 
 	return conn, nil
+}
+
+func (s *sftpService) initializeDirectories(conn *SFTPConnection, tenantConfig *config.TenantConfig) error {
+	directories := []string{}
+
+	if tenantConfig.SFTP.BasePath != "" {
+		directories = append(directories, tenantConfig.SFTP.BasePath)
+	}
+
+	if tenantConfig.SFTP.CombinedPath != "" && tenantConfig.SFTP.CombinedPath != tenantConfig.SFTP.BasePath {
+		directories = append(directories, tenantConfig.SFTP.CombinedPath)
+	}
+
+	for _, dir := range directories {
+		if err := s.ensureDirectory(conn, dir); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", dir, err)
+		}
+	}
+
+	if len(directories) > 0 {
+		log.Printf("[SFTP] Initialized %d directories for tenant %s", len(directories), tenantConfig.ID)
+	}
+
+	return nil
+}
+
+func (s *sftpService) ensureDirectory(conn *SFTPConnection, dirPath string) error {
+	// Clean and normalize path
+	dirPath = strings.ReplaceAll(dirPath, "\\", "/")
+	dirPath = strings.TrimSuffix(dirPath, "/")
+
+	if dirPath == "" || dirPath == "." || dirPath == "/" {
+		return nil
+	}
+
+	// Check if directory already exists
+	if _, err := conn.sftpClient.Stat(dirPath); err == nil {
+		return nil // Directory exists
+	}
+
+	// Create directory recursively
+	return s.createDirectoryRecursively(conn, dirPath)
+}
+
+func (s *sftpService) createDirectoryRecursively(conn *SFTPConnection, dirPath string) error {
+	// Clean the path
+	dirPath = strings.ReplaceAll(dirPath, "\\", "/")
+	dirPath = strings.TrimSuffix(dirPath, "/")
+
+	if dirPath == "" || dirPath == "." || dirPath == "/" {
+		return nil
+	}
+
+	// Check if directory exists
+	if _, err := conn.sftpClient.Stat(dirPath); err == nil {
+		return nil
+	}
+
+	// Create parent directory first
+	parentDir := filepath.Dir(dirPath)
+	parentDir = strings.ReplaceAll(parentDir, "\\", "/")
+
+	if parentDir != dirPath && parentDir != "." && parentDir != "/" {
+		if err := s.createDirectoryRecursively(conn, parentDir); err != nil {
+			return fmt.Errorf("failed to create parent directory %s: %w", parentDir, err)
+		}
+	}
+
+	// Create current directory
+	if err := conn.sftpClient.Mkdir(dirPath); err != nil {
+		if _, statErr := conn.sftpClient.Stat(dirPath); statErr == nil {
+			return nil
+		}
+		return fmt.Errorf("failed to create directory %s: %w", dirPath, err)
+	}
+
+	log.Printf("[SFTP] Created directory: %s", dirPath)
+	return nil
 }
 
 func (s *sftpService) closeConnection(conn *SFTPConnection) {
